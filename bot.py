@@ -1030,7 +1030,11 @@ async function refresh(){
     document.getElementById('conn').style.color = '#00e676';
 
     // Metrics
-    document.getElementById('mp').textContent = '₹'+(CAP+s.pnl).toLocaleString('en-IN');
+    const totalUnreal = d.open.reduce((sum,t)=>sum+(t.unrealised||0),0);
+    const totalVal = CAP + s.pnl + totalUnreal;
+    document.getElementById('mp').textContent = '₹'+totalVal.toLocaleString('en-IN');
+    document.getElementById('m-port-s').textContent = 
+      `base ₹1,00,000 · unrealised ${totalUnreal>=0?'+':''}₹${Math.abs(Math.round(totalUnreal)).toLocaleString('en-IN')}`;
     const mw = document.getElementById('mw');
     mw.textContent  = (s.pnl>=0?'+₹':'-₹') + Math.abs(s.pnl).toLocaleString('en-IN');
     mw.className    = 'mv '+(s.pnl>=0?'g':'r');
@@ -1061,17 +1065,28 @@ async function refresh(){
           const range    = Math.abs(t.target - t.sl);
           const progress = range > 0 ? Math.min(100, Math.max(0,
             (t.entry - t.sl) / range * 100)) : 0;
+          const unreal = t.unrealised || 0;
+          const unrPct = t.unreal_pct || 0;
+          const unrCol = unreal >= 0 ? '#00e676' : '#ff5252';
+          const unrSign = unreal >= 0 ? '+' : '';
+          // Progress bar: how far price has moved from entry toward target
+          const range = Math.abs(t.target - t.entry);
+          const moved = Math.abs((t.last_price || t.entry) - t.entry);
+          const prog2 = range > 0 ? Math.min(100, moved/range*100) : 0;
           return `<div class="tc open">
             <div class="tr">
               <span class="ts">${t.sym} <span style="font-size:9px;color:#3a5060">BUY</span></span>
-              <span class="tp o">OPEN · Day ${t.days_held}/5</span>
+              <span style="font-size:12px;font-weight:600;color:${unrCol}">${unrSign}₹${Math.abs(unreal).toLocaleString('en-IN')} (${unrSign}${unrPct}%)</span>
             </div>
             <div class="tm">
-              Entry ₹${t.entry} &nbsp;·&nbsp; SL ₹${t.sl} &nbsp;·&nbsp; TGT ₹${t.target}<br>
-              R:R ${t.rr}x &nbsp;·&nbsp; Risk ₹${t.risk_amt}
+              Last ₹${(t.last_price||t.entry).toLocaleString('en-IN')} &nbsp;·&nbsp; Entry ₹${t.entry} &nbsp;·&nbsp; Day ${t.days_held}/5<br>
+              SL ₹${t.sl} &nbsp;·&nbsp; TGT ₹${t.target} &nbsp;·&nbsp; R:R ${t.rr}x &nbsp;·&nbsp; Qty ${t.qty||'—'}
             </div>
             <div class="pbar-wrap">
-              <div class="pbar"><div class="pbar-fill" style="width:${progress}%;background:#ffab40"></div></div>
+              <div style="display:flex;justify-content:space-between;font-size:9px;color:#2a4050;margin-bottom:3px">
+                <span>SL ₹${t.sl}</span><span>Entry ₹${t.entry}</span><span>TGT ₹${t.target}</span>
+              </div>
+              <div class="pbar"><div class="pbar-fill" style="width:${prog2}%;background:${unrCol}"></div></div>
             </div>
           </div>`;
         }).join('')
@@ -1124,8 +1139,13 @@ setInterval(refresh, 10000);
                 "SELECT pnl,risk_used,wins,losses,time_exits FROM weekly_stats WHERE week_start=?",(ws,)
             ).fetchone() or {"pnl":0,"risk_used":0,"wins":0,"losses":0,"time_exits":0})
             open_t = [dict(r) for r in con.execute(
-                "SELECT sym,entry,sl,target,rr,risk_amt,days_held FROM trades WHERE status='open'"
+                "SELECT sym,entry,sl,target,rr,risk_amt,days_held,qty FROM trades WHERE status='open'"
             ).fetchall()]
+            for t in open_t:
+                row = con.execute("SELECT price FROM screener_cache WHERE sym=?", (t["sym"],)).fetchone()
+                t["last_price"] = round(float(row[0]),2) if row and row[0] else t["entry"]
+                t["unrealised"] = round((t["last_price"]-t["entry"])*t["qty"],2)
+                t["unreal_pct"] = round((t["last_price"]-t["entry"])/t["entry"]*100,2)
             closed = [dict(r) for r in con.execute(
                 "SELECT sym,entry,pnl,status,exit_reason FROM trades "
                 "WHERE status!='open' ORDER BY closed_at DESC LIMIT 15"
