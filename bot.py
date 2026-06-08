@@ -24,7 +24,7 @@ log = logging.getLogger("bot")
 # ── INSTALL DEPS ──────────────────────────────────────────────────────────────
 def ensure_deps():
     import importlib, subprocess, sys
-    for pkg in ["yfinance","pandas","numpy"]:
+    for pkg in ["yfinance","curl_cffi","pandas","numpy"]:
         try: importlib.import_module(pkg)
         except ImportError:
             log.info(f"pip install {pkg}…")
@@ -473,7 +473,24 @@ def run():
              f"Vol:{VOL_MULT}x ATR:{ATR_MIN_PCT}-{ATR_MAX_PCT}%")
     log.info("════════════════════════════════════════════")
 
-    con   = init_db()
+    con = init_db()
+
+    # Wipe stale cache entries caused by Yahoo 403 on previous runs
+    wiped = con.execute(
+        "DELETE FROM screener_cache WHERE reject_reason='insufficient_data' "
+        "OR reject_reason LIKE 'error:%' OR reject_reason LIKE 'cached:insufficient%'"
+    ).rowcount
+    con.commit()
+    if wiped:
+        log.info(f"  Cleared {wiped} stale cache entries from previous runs")
+
+    # Verify curl_cffi (fixes Yahoo Finance 403 on Railway/cloud IPs)
+    try:
+        import curl_cffi
+        log.info(f"  curl_cffi {curl_cffi.__version__} — Yahoo Finance cloud fix active")
+    except ImportError:
+        log.warning("  curl_cffi missing — add to requirements.txt!")
+
     cycle = 0
 
     while True:
