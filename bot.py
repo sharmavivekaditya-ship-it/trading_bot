@@ -542,126 +542,367 @@ def start_dashboard():
 <html><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ClaudeBot</title>
+<title>ClaudeBot · NSE</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#080b0f;color:#a8b4c0;font-family:'IBM Plex Mono',monospace;font-size:12px}
-.bar{background:#0d1520;border-bottom:1px solid #162030;padding:10px 18px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0}
+
+/* ── TOP BAR ── */
+.bar{background:#0d1520;border-bottom:1px solid #162030;padding:9px 18px;
+     display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:99}
 .logo{color:#00e676;font-weight:600;letter-spacing:3px;font-size:13px}
-.meta{font-size:10px;color:#3a5060;display:flex;gap:16px}
-.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#00e676;margin-right:5px;animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+.bar-r{display:flex;align-items:center;gap:14px;font-size:10px;color:#3a5060}
+.ping{width:6px;height:6px;border-radius:50%;background:#00e676;display:inline-block;
+      margin-right:5px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.15}}
+
+/* ── MARKET STATUS BANNER ── */
+.mkt-banner{display:flex;align-items:center;justify-content:space-between;
+            padding:10px 18px;border-bottom:1px solid #162030;transition:background .5s}
+.mkt-banner.open{background:#031a0d}
+.mkt-banner.closed{background:#0e0a02}
+.mkt-banner.pre{background:#030e1a}
+.mkt-left{display:flex;align-items:center;gap:12px}
+.mkt-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.mkt-banner.open   .mkt-dot{background:#00e676;box-shadow:0 0 8px #00e676;animation:pulse 1.5s infinite}
+.mkt-banner.closed .mkt-dot{background:#ff5252}
+.mkt-banner.pre    .mkt-dot{background:#ffab40;animation:pulse 2s infinite}
+.mkt-status{font-size:13px;font-weight:600}
+.mkt-banner.open   .mkt-status{color:#00e676}
+.mkt-banner.closed .mkt-status{color:#ff5252}
+.mkt-banner.pre    .mkt-status{color:#ffab40}
+.mkt-sub{font-size:10px;color:#3a5060;margin-top:1px}
+.mkt-right{text-align:right}
+.mkt-cd{font-size:22px;font-weight:600;color:#c8d8e8;letter-spacing:2px;font-variant-numeric:tabular-nums}
+.mkt-cd-label{font-size:9px;color:#3a5060;letter-spacing:1.5px;text-transform:uppercase;margin-top:2px}
+.mkt-prog{height:3px;background:#0d1520;border-radius:2px;overflow:hidden;margin-top:8px;width:100%}
+.mkt-prog-fill{height:100%;border-radius:2px;transition:width 1s linear}
+.mkt-banner.open   .mkt-prog-fill{background:#00e676}
+.mkt-banner.closed .mkt-prog-fill{background:#ff5252}
+.mkt-banner.pre    .mkt-prog-fill{background:#ffab40}
+
+/* ── IST CLOCK (updates every second in JS) ── */
+.ist{font-size:11px;color:#4a6070}
+
+/* ── METRICS ── */
 .metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:#162030}
-@media(max-width:600px){.metrics{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:640px){.metrics{grid-template-columns:repeat(2,1fr)}}
 .met{background:#0d1520;padding:12px 14px}
 .ml{font-size:9px;color:#3a5060;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px}
 .mv{font-size:20px;font-weight:600;color:#c8d8e8}
 .mv.g{color:#00e676}.mv.r{color:#ff5252}.mv.a{color:#ffab40}
 .ms{font-size:10px;color:#2a4050;margin-top:2px}
+
+/* ── BODY GRID ── */
 .body{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#162030;margin-top:1px}
-@media(max-width:600px){.body{grid-template-columns:1fr}}
+@media(max-width:640px){.body{grid-template-columns:1fr}}
 .panel{background:#080b0f;padding:14px}
-.pt{font-size:9px;color:#2a5060;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
-.tc{background:#0d1520;border-radius:6px;padding:9px 11px;margin-bottom:5px;border-left:3px solid #1e2d3d;font-size:11px}
-.tc.open{border-left-color:#ffab40}
-.tc.win{border-left-color:#00e676}
-.tc.loss{border-left-color:#ff5252}
-.tr{display:flex;justify-content:space-between;margin-bottom:3px}
+.pt{font-size:9px;color:#2a5060;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px;
+    display:flex;justify-content:space-between;align-items:center}
+.pt-badge{font-size:9px;padding:2px 7px;border-radius:3px;letter-spacing:1px;font-weight:600}
+.pt-badge.open{background:#1a1000;color:#ffab40;border:1px solid #3a2800}
+.pt-badge.closed-ok{background:#001a08;color:#00e676;border:1px solid #003a15}
+.pt-badge.closed-no{background:#1a0505;color:#ff5252;border:1px solid #3a0808}
+
+/* ── TRADE CARDS ── */
+.tc{background:#0d1520;border-radius:6px;padding:10px 12px;margin-bottom:5px;
+    border-left:3px solid #1e2d3d;font-size:11px}
+.tc.open {border-left-color:#ffab40}
+.tc.win  {border-left-color:#00e676}
+.tc.loss {border-left-color:#ff5252}
+.tr{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
 .ts{color:#c8d8e8;font-weight:600}
 .tp.p{color:#00e676}.tp.n{color:#ff5252}.tp.o{color:#ffab40}
-.tm{color:#3a5060;line-height:1.6}
-.log{background:#0d1520;border-radius:6px;padding:10px;font-size:10px;line-height:1.8;max-height:260px;overflow-y:auto}
-.log::-webkit-scrollbar{width:3px}.log::-webkit-scrollbar-thumb{background:#1e3040}
-.g{color:#00e676}.r{color:#ff5252}.a{color:#ffab40}.b{color:#40c4ff}.d{color:#2a4050}
-.empty{color:#1e3040;text-align:center;padding:20px 0;font-size:11px}
-.full{background:#080b0f;padding:14px;border-top:1px solid #162030;margin-top:1px}
+.tm{color:#3a5060;line-height:1.7}
+.pbar-wrap{margin-top:6px}
+.pbar{height:3px;background:#0a1520;border-radius:2px;overflow:hidden}
+.pbar-fill{height:100%;border-radius:2px;transition:width .5s}
+
+/* ── RISK BAR ── */
 .rb{height:4px;background:#0d1520;border-radius:2px;overflow:hidden;margin-top:8px}
 .rf{height:100%;border-radius:2px;transition:width .6s}
+
+/* ── LOG ── */
+.full{background:#080b0f;padding:14px;border-top:1px solid #162030;margin-top:1px}
+.log{background:#0d1520;border-radius:6px;padding:10px;font-size:10px;
+     line-height:1.9;max-height:280px;overflow-y:auto}
+.log::-webkit-scrollbar{width:3px}
+.log::-webkit-scrollbar-thumb{background:#1e3040}
+.g{color:#00e676}.r{color:#ff5252}.a{color:#ffab40}.b{color:#40c4ff}.d{color:#2a4050}
+.empty{color:#1e3040;text-align:center;padding:24px 0;font-size:11px}
 </style></head><body>
+
+<!-- TOP BAR -->
 <div class="bar">
-  <div class="logo">◈ CLAUDEBOT · LIVE</div>
-  <div class="meta">
-    <span><span class="dot"></span>PAPER MODE</span>
-    <span id="st">--:--:--</span>
-    <span id="rl" style="color:#1a4030">●</span>
+  <div class="logo">◈ CLAUDEBOT · NSE SWING</div>
+  <div class="bar-r">
+    <span><span class="ping"></span>PAPER MODE</span>
+    <span class="ist" id="ist-clock">--:--:-- IST</span>
+    <span id="conn" style="color:#1a4030;font-size:14px">●</span>
   </div>
 </div>
+
+<!-- MARKET STATUS BANNER -->
+<div class="mkt-banner closed" id="mkt-banner">
+  <div style="flex:1">
+    <div class="mkt-left">
+      <div class="mkt-dot"></div>
+      <div>
+        <div class="mkt-status" id="mkt-status">MARKET CLOSED</div>
+        <div class="mkt-sub" id="mkt-sub">NSE · Mon–Fri 09:15–15:30 IST</div>
+      </div>
+    </div>
+    <div class="mkt-prog"><div class="mkt-prog-fill" id="mkt-prog" style="width:0%"></div></div>
+  </div>
+  <div class="mkt-right" style="margin-left:24px">
+    <div class="mkt-cd" id="mkt-cd">--:--:--</div>
+    <div class="mkt-cd-label" id="mkt-cd-label">until open</div>
+  </div>
+</div>
+
+<!-- METRICS -->
 <div class="metrics">
   <div class="met"><div class="ml">Portfolio</div><div class="mv" id="mp">—</div><div class="ms">base ₹1,00,000</div></div>
   <div class="met"><div class="ml">Week P&L</div><div class="mv g" id="mw">—</div><div class="ms" id="mws">—</div></div>
   <div class="met"><div class="ml">Win Rate</div><div class="mv" id="mwr">—</div><div class="ms" id="mwrs">—</div></div>
   <div class="met"><div class="ml">Risk Used</div><div class="mv a" id="mr">—</div><div class="ms" id="mrs">—</div></div>
-  <div class="met"><div class="ml">Open Trades</div><div class="mv a" id="mo">—</div><div class="ms">max 3</div></div>
+  <div class="met"><div class="ml">Open Trades</div><div class="mv a" id="mo">—</div><div class="ms">max 3 concurrent</div></div>
 </div>
+
+<!-- TRADES -->
 <div class="body">
   <div class="panel">
-    <div class="pt">Open Positions</div>
-    <div id="op"><div class="empty">loading…</div></div>
+    <div class="pt">
+      Open Positions
+      <span class="pt-badge open" id="op-badge">0 OPEN</span>
+    </div>
+    <div id="op"><div class="empty">No open positions</div></div>
     <div class="rb"><div class="rf" id="rf" style="width:0%;background:#00e676"></div></div>
-    <div style="font-size:10px;color:#2a4050;margin-top:5px" id="rl2"></div>
+    <div style="font-size:10px;color:#2a4050;margin-top:5px" id="risk-label">Risk: ₹0 of ₹3,000 weekly budget used</div>
   </div>
   <div class="panel">
-    <div class="pt">Closed Trades</div>
-    <div id="ct"><div class="empty">loading…</div></div>
+    <div class="pt">
+      Closed Trades
+      <span class="pt-badge closed-ok" id="ct-badge">0 CLOSED</span>
+    </div>
+    <div id="ct"><div class="empty">No closed trades yet</div></div>
   </div>
 </div>
+
+<!-- LOG -->
 <div class="full">
-  <div class="pt">Bot Log (live · refreshes every 10s)</div>
-  <div class="log" id="lg">loading…</div>
+  <div class="pt">
+    Bot Activity Log
+    <span style="font-size:9px;color:#1a3040">auto-refresh 10s</span>
+  </div>
+  <div class="log" id="lg"><div class="d">connecting…</div></div>
 </div>
+
 <script>
-const C=100000;
-function color(l){
-  if(l.includes('◈')||l.includes('WIN')||l.includes('+₹')||l.includes('SETUP')) return 'g';
-  if(l.includes('ERROR')||l.includes('SL_HIT')||l.includes('-₹')) return 'r';
-  if(l.includes('WARNING')||l.includes('HOLD')||l.includes('TIME')) return 'a';
-  if(l.includes('Cycle')||l.includes('Scan')||l.includes('Progress')) return 'b';
+const CAP = 100000;
+const OPEN_START  = { h:9,  m:15 };   // IST
+const OPEN_END    = { h:15, m:30 };
+const PRE_MINUTES = 30;               // show "pre-open" window before open
+
+function nowIST() {
+  const now = new Date();
+  // UTC + 5:30
+  const ist = new Date(now.getTime() + (5*60+30)*60000);
+  return ist;
+}
+
+function marketState() {
+  const t   = nowIST();
+  const day = t.getUTCDay();   // 0=Sun,6=Sat
+  const h   = t.getUTCHours(), m = t.getUTCMinutes(), s = t.getUTCSeconds();
+  const mins = h*60+m;
+  const openMins  = OPEN_START.h*60+OPEN_START.m;
+  const closeMins = OPEN_END.h*60+OPEN_END.m;
+
+  if (day === 0 || day === 6) return { state:'closed', label:'MARKET CLOSED', sub:'Reopens Monday 09:15 IST' };
+  if (mins < openMins - PRE_MINUTES) return { state:'closed', label:'MARKET CLOSED', sub:'NSE opens 09:15 IST' };
+  if (mins < openMins) return { state:'pre', label:'PRE-OPEN', sub:'Market opens soon · 09:00–09:15 call auction' };
+  if (mins <= closeMins) return { state:'open', label:'MARKET OPEN', sub:'NSE live · 09:15–15:30 IST' };
+  return { state:'closed', label:'MARKET CLOSED', sub:'Reopens tomorrow 09:15 IST' };
+}
+
+function secUntilNext(targetH, targetM) {
+  const t    = nowIST();
+  const h    = t.getUTCHours(), m = t.getUTCMinutes(), s = t.getUTCSeconds();
+  let secs   = (targetH - h)*3600 + (targetM - m)*60 - s;
+  if (secs < 0) secs += 86400;
+  return secs;
+}
+
+function secUntilNextWeekday(targetH, targetM) {
+  // Find next Mon–Fri at targetH:targetM IST
+  const t   = nowIST();
+  let d     = new Date(t);
+  for (let i = 0; i < 7; i++) {
+    const day  = d.getUTCDay();
+    const h    = d.getUTCHours(), m = d.getUTCMinutes(), s = d.getUTCSeconds();
+    const mins = h*60+m;
+    const tMins = targetH*60+targetM;
+    if (day >= 1 && day <= 5 && (i > 0 || mins < tMins)) {
+      let secs = (targetH-h)*3600 + (targetM-m)*60 - s;
+      if (secs < 0 && i === 0) secs += 86400;
+      return Math.max(0, secs);
+    }
+    d = new Date(d.getTime() + 86400000);
+  }
+  return 0;
+}
+
+function fmt(secs) {
+  const h = Math.floor(secs/3600);
+  const m = Math.floor((secs%3600)/60);
+  const s = secs%60;
+  if (h > 0) return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+  return `${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+function updateMarketBanner() {
+  const ms  = marketState();
+  const ban = document.getElementById('mkt-banner');
+  ban.className = 'mkt-banner ' + ms.state;
+  document.getElementById('mkt-status').textContent = ms.label;
+  document.getElementById('mkt-sub').textContent    = ms.sub;
+
+  const t    = nowIST();
+  const day  = t.getUTCDay();
+  const h    = t.getUTCHours(), m = t.getUTCMinutes();
+  const mins = h*60+m;
+  const openMins  = OPEN_START.h*60+OPEN_START.m;
+  const closeMins = OPEN_END.h*60+OPEN_END.m;
+
+  let cdSecs = 0, cdLabel = '', prog = 0;
+  if (ms.state === 'open') {
+    cdSecs  = secUntilNext(OPEN_END.h, OPEN_END.m);
+    cdLabel = 'until close';
+    const sessionLen = (closeMins - openMins) * 60;
+    const elapsed    = (mins - openMins)*60 + t.getUTCSeconds();
+    prog = Math.min(100, elapsed/sessionLen*100);
+  } else if (ms.state === 'pre') {
+    cdSecs  = secUntilNext(OPEN_START.h, OPEN_START.m);
+    cdLabel = 'until open';
+    prog = Math.min(100, (1 - cdSecs/(PRE_MINUTES*60))*100);
+  } else {
+    cdSecs  = secUntilNextWeekday(OPEN_START.h, OPEN_START.m);
+    cdLabel = 'until open';
+    prog = 0;
+  }
+
+  document.getElementById('mkt-cd').textContent       = fmt(cdSecs);
+  document.getElementById('mkt-cd-label').textContent = cdLabel;
+  document.getElementById('mkt-prog').style.width     = prog.toFixed(1)+'%';
+}
+
+// IST clock ticking every second
+function tickIST() {
+  const t = nowIST();
+  const hh = String(t.getUTCHours()).padStart(2,'0');
+  const mm = String(t.getUTCMinutes()).padStart(2,'0');
+  const ss = String(t.getUTCSeconds()).padStart(2,'0');
+  document.getElementById('ist-clock').textContent = hh+':'+mm+':'+ss+' IST';
+  updateMarketBanner();
+}
+setInterval(tickIST, 1000);
+tickIST();
+
+// ── LOG COLOURING ──
+function logClass(l){
+  if (l.includes('◈')||l.includes('+₹')||l.includes('SETUP')||l.includes('TARGET_HIT')) return 'g';
+  if (l.includes('ERROR')||l.includes('SL_HIT')||l.includes('-₹'))                      return 'r';
+  if (l.includes('WARNING')||l.includes('HOLD')||l.includes('TIME_STOP'))               return 'a';
+  if (l.includes('Cycle')||l.includes('Scanned')||l.includes('Progress'))               return 'b';
   return 'd';
 }
+
+// ── API REFRESH ──
 async function refresh(){
-  try{
-    const d=await(await fetch('/api/status')).json();
-    const s=d.stats;
-    document.getElementById('st').textContent=d.time;
-    document.getElementById('rl').style.color='#00e676';
-    // metrics
-    document.getElementById('mp').textContent='₹'+(C+s.pnl).toLocaleString('en-IN');
-    const mw=document.getElementById('mw');
-    mw.textContent=(s.pnl>=0?'+₹':'-₹')+Math.abs(s.pnl).toLocaleString('en-IN');
-    mw.className='mv '+(s.pnl>=0?'g':'r');
-    document.getElementById('mws').textContent=((s.pnl/C)*100).toFixed(2)+'% of capital';
-    const tot=s.wins+s.losses;
-    document.getElementById('mwr').textContent=tot?Math.round(s.wins/tot*100)+'%':'—';
-    document.getElementById('mwrs').textContent=s.wins+'W / '+s.losses+'L';
-    const rp=Math.round(s.risk_used/3000*100);
-    const mr=document.getElementById('mr');
-    mr.textContent=rp+'%';
-    mr.className='mv '+(rp>80?'r':rp>50?'a':'a');
-    document.getElementById('mrs').textContent='₹'+s.risk_used+' / ₹3,000';
-    document.getElementById('mo').textContent=d.open.length;
-    // risk bar
-    const rf=document.getElementById('rf');
-    rf.style.width=Math.min(100,rp)+'%';
-    rf.style.background=rp>80?'#ff5252':rp>50?'#ffab40':'#00e676';
-    document.getElementById('rl2').textContent='Risk: ₹'+s.risk_used+' used of ₹3,000 weekly budget';
-    // open trades
-    document.getElementById('op').innerHTML=d.open.length?d.open.map(t=>
-      `<div class="tc open"><div class="tr"><span class="ts">${t.sym} <span style="font-size:9px;color:#3a5060">BUY</span></span><span class="tp o">OPEN</span></div>
-       <div class="tm">Entry ₹${t.entry} · SL ₹${t.sl} · TGT ₹${t.target}<br>R:R ${t.rr}x · Risk ₹${t.risk_amt} · Day ${t.days_held}/${5}</div></div>`
-    ).join(''):'<div class="empty">No open positions</div>';
-    // closed
-    document.getElementById('ct').innerHTML=d.closed.length?d.closed.map(t=>
-      `<div class="tc ${t.status}"><div class="tr"><span class="ts">${t.sym}</span>
-       <span class="tp ${t.pnl>=0?'p':'n'}">${t.pnl>=0?'+₹':'-₹'}${Math.abs(t.pnl)}</span></div>
-       <div class="tm">${t.exit_reason||t.status} · Entry ₹${t.entry}</div></div>`
-    ).join(''):'<div class="empty">No closed trades yet</div>';
-    // log
-    document.getElementById('lg').innerHTML=d.logs.map(l=>
-      `<div class="${color(l)}">${l}</div>`).join('');
-  }catch(e){document.getElementById('rl').style.color='#ff5252';}
+  try {
+    const d = await (await fetch('/api/status')).json();
+    const s = d.stats;
+    document.getElementById('conn').style.color = '#00e676';
+
+    // Metrics
+    document.getElementById('mp').textContent = '₹'+(CAP+s.pnl).toLocaleString('en-IN');
+    const mw = document.getElementById('mw');
+    mw.textContent  = (s.pnl>=0?'+₹':'-₹') + Math.abs(s.pnl).toLocaleString('en-IN');
+    mw.className    = 'mv '+(s.pnl>=0?'g':'r');
+    document.getElementById('mws').textContent = ((s.pnl/CAP)*100).toFixed(2)+'% of capital';
+    const tot = s.wins+s.losses;
+    document.getElementById('mwr').textContent  = tot ? Math.round(s.wins/tot*100)+'%' : '—';
+    document.getElementById('mwrs').textContent = s.wins+'W / '+s.losses+'L';
+    const rp = Math.round(s.risk_used/3000*100);
+    const mr = document.getElementById('mr');
+    mr.textContent  = rp+'%';
+    mr.className    = 'mv '+(rp>80?'r':rp>50?'a':'a');
+    document.getElementById('mrs').textContent  = '₹'+s.risk_used+' / ₹3,000';
+    document.getElementById('mo').textContent   = d.open.length;
+
+    // Risk bar
+    const rf = document.getElementById('rf');
+    rf.style.width      = Math.min(100,rp)+'%';
+    rf.style.background = rp>80?'#ff5252':rp>50?'#ffab40':'#00e676';
+    document.getElementById('risk-label').textContent =
+      'Risk: ₹'+s.risk_used+' of ₹3,000 weekly budget used ('+rp+'%)';
+
+    // Open trades badge
+    document.getElementById('op-badge').textContent = d.open.length+' OPEN';
+
+    // Open positions
+    document.getElementById('op').innerHTML = d.open.length
+      ? d.open.map(t => {
+          const range    = Math.abs(t.target - t.sl);
+          const progress = range > 0 ? Math.min(100, Math.max(0,
+            (t.entry - t.sl) / range * 100)) : 0;
+          return `<div class="tc open">
+            <div class="tr">
+              <span class="ts">${t.sym} <span style="font-size:9px;color:#3a5060">BUY</span></span>
+              <span class="tp o">OPEN · Day ${t.days_held}/5</span>
+            </div>
+            <div class="tm">
+              Entry ₹${t.entry} &nbsp;·&nbsp; SL ₹${t.sl} &nbsp;·&nbsp; TGT ₹${t.target}<br>
+              R:R ${t.rr}x &nbsp;·&nbsp; Risk ₹${t.risk_amt}
+            </div>
+            <div class="pbar-wrap">
+              <div class="pbar"><div class="pbar-fill" style="width:${progress}%;background:#ffab40"></div></div>
+            </div>
+          </div>`;
+        }).join('')
+      : '<div class="empty">No open positions<br><span style="font-size:10px;color:#1a3020">Bot is scanning for RSI cross + uptrend setups</span></div>';
+
+    // Closed trades
+    const wins  = d.closed.filter(t=>t.status==='win').length;
+    const total = d.closed.length;
+    document.getElementById('ct-badge').textContent = total+' CLOSED';
+    document.getElementById('ct-badge').className   =
+      'pt-badge '+(wins>total/2?'closed-ok':'closed-no');
+    document.getElementById('ct').innerHTML = d.closed.length
+      ? d.closed.map(t =>
+          `<div class="tc ${t.status}">
+            <div class="tr">
+              <span class="ts">${t.sym}</span>
+              <span class="tp ${t.pnl>=0?'p':'n'}">${t.pnl>=0?'+₹':'-₹'}${Math.abs(t.pnl).toLocaleString('en-IN')}</span>
+            </div>
+            <div class="tm">${t.exit_reason||t.status.toUpperCase()} &nbsp;·&nbsp; Entry ₹${t.entry}</div>
+          </div>`
+        ).join('')
+      : '<div class="empty">No closed trades yet</div>';
+
+    // Log
+    document.getElementById('lg').innerHTML = d.logs.length
+      ? d.logs.map(l=>`<div class="${logClass(l)}">${l}</div>`).join('')
+      : '<div class="d">No log entries yet</div>';
+
+  } catch(e) {
+    document.getElementById('conn').style.color = '#ff5252';
+  }
 }
-refresh(); setInterval(refresh,10000);
+refresh();
+setInterval(refresh, 10000);
 </script></body></html>"""
 
     @app.route("/")
@@ -679,11 +920,12 @@ refresh(); setInterval(refresh,10000);
             s = dict(con.execute(
                 "SELECT pnl,risk_used,wins,losses,time_exits FROM weekly_stats WHERE week_start=?",(ws,)
             ).fetchone() or {"pnl":0,"risk_used":0,"wins":0,"losses":0,"time_exits":0})
-            open_t  = [dict(r) for r in con.execute(
+            open_t = [dict(r) for r in con.execute(
                 "SELECT sym,entry,sl,target,rr,risk_amt,days_held FROM trades WHERE status='open'"
             ).fetchall()]
-            closed  = [dict(r) for r in con.execute(
-                "SELECT sym,entry,pnl,status,exit_reason FROM trades WHERE status!='open' ORDER BY closed_at DESC LIMIT 15"
+            closed = [dict(r) for r in con.execute(
+                "SELECT sym,entry,pnl,status,exit_reason FROM trades "
+                "WHERE status!='open' ORDER BY closed_at DESC LIMIT 15"
             ).fetchall()]
             con.close()
             logs = []
@@ -695,7 +937,8 @@ refresh(); setInterval(refresh,10000);
             return jsonify({"stats":s,"open":open_t,"closed":closed,"logs":logs,
                             "time":datetime.now().strftime("%H:%M:%S")})
         except Exception as e:
-            return jsonify({"error":str(e),"stats":{"pnl":0,"risk_used":0,"wins":0,"losses":0},
+            return jsonify({"error":str(e),
+                            "stats":{"pnl":0,"risk_used":0,"wins":0,"losses":0},
                             "open":[],"closed":[],"logs":[],"time":"--:--:--"})
 
     port = int(os.environ.get("PORT", 8000))
