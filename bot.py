@@ -46,22 +46,23 @@ BATCH_SIZE      = 30        # symbols per batch (Railway memory-safe)
 BATCH_PAUSE     = 2         # seconds between batches
 
 # Liquidity gates
-MIN_PRICE       = 100
+MIN_PRICE       = 50         # lowered: include mid-caps from ₹50
 MAX_PRICE       = 8_000
-MIN_AVG_VOL     = 300_000
+MIN_AVG_VOL     = 150_000    # lowered: include liquid mid-caps
 
 # Strategy params
 RSI_PERIOD      = 14
-RSI_ENTRY       = 32        # RSI must cross UP through this level
-RSI_EXIT_OB     = 72        # exit if RSI hits overbought
+RSI_ENTRY_LOW   = 28         # RSI zone bottom — oversold
+RSI_ENTRY_HIGH  = 42         # RSI zone top — still cheap
+RSI_EXIT_OB     = 70         # exit if RSI hits overbought
 EMA_FAST        = 20
 EMA_SLOW        = 50
-VOL_MULT        = 1.5       # volume must be this × 20d avg
+VOL_MULT        = 1.2        # volume must be this × 20d avg (relaxed)
 ATR_PERIOD      = 14
-ATR_MIN_PCT     = 1.5       # min daily ATR%
-ATR_MAX_PCT     = 5.0       # max daily ATR%
+ATR_MIN_PCT     = 1.0        # min daily ATR% (relaxed)
+ATR_MAX_PCT     = 6.0        # max daily ATR% (relaxed slightly)
 ATR_STOP_MULT   = 1.5
-ATR_TARGET_MULT = 3.0       # guarantees R:R = 2.0
+ATR_TARGET_MULT = 3.0        # guarantees R:R = 2.0
 TIME_STOP_DAYS  = 5
 
 NSE_CSV = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
@@ -215,18 +216,22 @@ def screen(sym, cache_cutoff, con):
                     atr_pct  = atr_val / price * 100
                     vol_ratio = today_vol / avg_vol
 
-                    # Gate 3: RSI cross (was below 32, now above)
-                    if not (rsi_prev < RSI_ENTRY <= rsi_now):
-                        reject = f"no_rsi_cross(prev:{rsi_prev:.1f}→now:{rsi_now:.1f})"
-                    # Gate 4: uptrend
+                    # Gate 3: RSI in oversold-recovery zone
+                    # Condition: RSI currently between 28-42 AND was below 45 yesterday
+                    # This catches: fresh crosses, ongoing recoveries, and dip bounces
+                    rsi_in_zone = RSI_ENTRY_LOW <= rsi_now <= RSI_ENTRY_HIGH
+                    rsi_was_low = rsi_prev < 45
+                    if not (rsi_in_zone and rsi_was_low):
+                        reject = f"rsi_not_setup(prev:{rsi_prev:.1f} now:{rsi_now:.1f} zone:{RSI_ENTRY_LOW}-{RSI_ENTRY_HIGH})"
+                    # Gate 4: uptrend (price > EMA50, EMA20 > EMA50)
                     elif not (price > ema50 and ema20 > ema50):
                         reject = f"no_uptrend(p:{price:.0f} e20:{ema20:.0f} e50:{ema50:.0f})"
-                    # Gate 5: volume
+                    # Gate 5: volume above threshold
                     elif vol_ratio < VOL_MULT:
-                        reject = f"low_vol_ratio({vol_ratio:.2f}x)"
-                    # Gate 6: ATR range
+                        reject = f"low_vol_ratio({vol_ratio:.2f}x<{VOL_MULT}x)"
+                    # Gate 6: ATR in swingable range
                     elif not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
-                        reject = f"atr_oor({atr_pct:.1f}%)"
+                        reject = f"atr_oor({atr_pct:.1f}% need {ATR_MIN_PCT}-{ATR_MAX_PCT}%)"
                     else:
                         # ALL CONDITIONS MET — compute setup
                         entry  = round(price, 2)
@@ -234,7 +239,7 @@ def screen(sym, cache_cutoff, con):
                         target = round(entry + ATR_TARGET_MULT * atr_val, 2)
                         rr     = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)
 
-                        rsi_score   = max(0, 100-(rsi_now-RSI_ENTRY)*4)
+                        rsi_score   = max(0, 100-(rsi_now-RSI_ENTRY_LOW)*5)  # best score at low end of zone
                         vol_score   = min(100, (vol_ratio-VOL_MULT)/2*100)
                         atr_score   = max(0, 100-abs(atr_pct-2.5)*15)
                         ema_gap     = (ema20-ema50)/ema50*100
@@ -469,7 +474,7 @@ def run():
     log.info("  ClaudeBot v4 · Pure Algo · NSE Swing")
     log.info("  Strategy: RSI cross + EMA trend + ATR size")
     log.info(f"  Capital:₹{CAPITAL:,}  Risk/week:₹{MAX_WEEKLY_RISK:,}")
-    log.info(f"  Params: RSI_entry:{RSI_ENTRY} EMA:{EMA_FAST}/{EMA_SLOW} "
+    log.info(f"  Params: RSI_zone:{RSI_ENTRY_LOW}-{RSI_ENTRY_HIGH} EMA:{EMA_FAST}/{EMA_SLOW} "
              f"Vol:{VOL_MULT}x ATR:{ATR_MIN_PCT}-{ATR_MAX_PCT}%")
     log.info("════════════════════════════════════════════")
 
