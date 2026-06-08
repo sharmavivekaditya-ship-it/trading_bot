@@ -372,6 +372,31 @@ def screen(sym, cache_cutoff, con):
 
 
 
+def is_market_open() -> bool:
+    """NSE is open Mon–Fri 09:15–15:30 IST (UTC+5:30)."""
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = datetime.now(tz=__import__('datetime').timezone.utc).replace(tzinfo=None) + ist_offset
+    if now_ist.weekday() >= 5:
+        return False
+    market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now_ist <= market_close
+
+def time_to_open() -> str:
+    """Human-readable time until next NSE open."""
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = datetime.now(tz=__import__('datetime').timezone.utc).replace(tzinfo=None) + ist_offset
+    candidate = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now_ist >= candidate:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    delta = candidate - now_ist
+    h, rem = divmod(int(delta.total_seconds()), 3600)
+    m = rem // 60
+    return f"{h}h {m}m"
+
+
 def scan_market(universe, con):
     cache_cutoff = (datetime.now()-timedelta(hours=4)).isoformat()
     setups = []
