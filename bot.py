@@ -42,8 +42,9 @@ RISK_PER_TRADE  = 800
 MAX_OPEN        = 3
 SCAN_INTERVAL   = 300       # seconds between cycles
 TOP_N           = 3         # max new trades per cycle
-BATCH_SIZE      = 30        # symbols per batch (Railway memory-safe)
-BATCH_PAUSE     = 2         # seconds between batches
+BATCH_SIZE      = 50        # symbols per batch
+BATCH_PAUSE     = 1         # seconds between batches
+USE_NIFTY500    = True      # scan Nifty 500 only (covers 95% of volume, fits Railway)
 
 # Liquidity gates
 MIN_PRICE       = 50         # lowered: include mid-caps from ₹50
@@ -122,17 +123,44 @@ def init_db():
     return con
 
 # ── UNIVERSE ──────────────────────────────────────────────────────────────────
+# Nifty 500 index CSV from NSE (official, updated semi-annually)
+NIFTY500_CSV = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+
 def fetch_universe():
-    try:
-        req = urllib.request.Request(NSE_CSV, headers={"User-Agent":"Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            df = pd.read_csv(io.StringIO(r.read().decode("latin-1")))
-        syms = df["SYMBOL"].dropna().str.strip().tolist()
-        log.info(f"NSE universe: {len(syms)} symbols")
-        return syms
-    except Exception as e:
-        log.warning(f"NSE CSV failed ({e}) — fallback {len(FALLBACK)} symbols")
-        return FALLBACK
+    """
+    Fetch Nifty 500 constituent list from NSE.
+    These 500 stocks cover ~95% of NSE market cap and trading volume.
+    Scanning all 2385 NSE stocks takes ~25 min and causes Railway restarts.
+    Nifty 500 scan takes ~6 min — completes within Railway's limits.
+    Falls back to hardcoded list if download fails.
+    """
+    if USE_NIFTY500:
+        try:
+            req = urllib.request.Request(
+                NIFTY500_CSV,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://nseindia.com"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                df = pd.read_csv(io.StringIO(r.read().decode("latin-1")))
+            # NSE Nifty 500 CSV has column "Symbol"
+            col = [c for c in df.columns if "symbol" in c.lower()][0]
+            syms = df[col].dropna().str.strip().tolist()
+            log.info(f"Nifty 500 universe: {len(syms)} symbols loaded")
+            return syms
+        except Exception as e:
+            log.warning(f"Nifty 500 CSV failed ({e}) — using fallback list")
+            return FALLBACK
+    else:
+        try:
+            req = urllib.request.Request(NSE_CSV, headers={"User-Agent":"Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                df = pd.read_csv(io.StringIO(r.read().decode("latin-1")))
+            syms = df["SYMBOL"].dropna().str.strip().tolist()
+            log.info(f"Full NSE universe: {len(syms)} symbols")
+            return syms
+        except Exception as e:
+            log.warning(f"NSE CSV failed ({e}) — fallback {len(FALLBACK)} symbols")
+            return FALLBACK
 
 # ── INDICATORS ────────────────────────────────────────────────────────────────
 def calc_rsi(close, period=14):
