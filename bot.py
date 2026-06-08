@@ -497,5 +497,183 @@ def run():
         )
         time.sleep(SCAN_INTERVAL)
 
+# ── EMBEDDED DASHBOARD (Flask, runs in background thread) ────────────────────
+def start_dashboard():
+    from flask import Flask, jsonify, render_template_string
+    import threading
+
+    app = Flask(__name__)
+    DB  = "trades.db"
+
+    DASH_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClaudeBot</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#080b0f;color:#a8b4c0;font-family:'IBM Plex Mono',monospace;font-size:12px}
+.bar{background:#0d1520;border-bottom:1px solid #162030;padding:10px 18px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0}
+.logo{color:#00e676;font-weight:600;letter-spacing:3px;font-size:13px}
+.meta{font-size:10px;color:#3a5060;display:flex;gap:16px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#00e676;margin-right:5px;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:#162030}
+@media(max-width:600px){.metrics{grid-template-columns:repeat(2,1fr)}}
+.met{background:#0d1520;padding:12px 14px}
+.ml{font-size:9px;color:#3a5060;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:4px}
+.mv{font-size:20px;font-weight:600;color:#c8d8e8}
+.mv.g{color:#00e676}.mv.r{color:#ff5252}.mv.a{color:#ffab40}
+.ms{font-size:10px;color:#2a4050;margin-top:2px}
+.body{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:#162030;margin-top:1px}
+@media(max-width:600px){.body{grid-template-columns:1fr}}
+.panel{background:#080b0f;padding:14px}
+.pt{font-size:9px;color:#2a5060;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+.tc{background:#0d1520;border-radius:6px;padding:9px 11px;margin-bottom:5px;border-left:3px solid #1e2d3d;font-size:11px}
+.tc.open{border-left-color:#ffab40}
+.tc.win{border-left-color:#00e676}
+.tc.loss{border-left-color:#ff5252}
+.tr{display:flex;justify-content:space-between;margin-bottom:3px}
+.ts{color:#c8d8e8;font-weight:600}
+.tp.p{color:#00e676}.tp.n{color:#ff5252}.tp.o{color:#ffab40}
+.tm{color:#3a5060;line-height:1.6}
+.log{background:#0d1520;border-radius:6px;padding:10px;font-size:10px;line-height:1.8;max-height:260px;overflow-y:auto}
+.log::-webkit-scrollbar{width:3px}.log::-webkit-scrollbar-thumb{background:#1e3040}
+.g{color:#00e676}.r{color:#ff5252}.a{color:#ffab40}.b{color:#40c4ff}.d{color:#2a4050}
+.empty{color:#1e3040;text-align:center;padding:20px 0;font-size:11px}
+.full{background:#080b0f;padding:14px;border-top:1px solid #162030;margin-top:1px}
+.rb{height:4px;background:#0d1520;border-radius:2px;overflow:hidden;margin-top:8px}
+.rf{height:100%;border-radius:2px;transition:width .6s}
+</style></head><body>
+<div class="bar">
+  <div class="logo">◈ CLAUDEBOT · LIVE</div>
+  <div class="meta">
+    <span><span class="dot"></span>PAPER MODE</span>
+    <span id="st">--:--:--</span>
+    <span id="rl" style="color:#1a4030">●</span>
+  </div>
+</div>
+<div class="metrics">
+  <div class="met"><div class="ml">Portfolio</div><div class="mv" id="mp">—</div><div class="ms">base ₹1,00,000</div></div>
+  <div class="met"><div class="ml">Week P&L</div><div class="mv g" id="mw">—</div><div class="ms" id="mws">—</div></div>
+  <div class="met"><div class="ml">Win Rate</div><div class="mv" id="mwr">—</div><div class="ms" id="mwrs">—</div></div>
+  <div class="met"><div class="ml">Risk Used</div><div class="mv a" id="mr">—</div><div class="ms" id="mrs">—</div></div>
+  <div class="met"><div class="ml">Open Trades</div><div class="mv a" id="mo">—</div><div class="ms">max 3</div></div>
+</div>
+<div class="body">
+  <div class="panel">
+    <div class="pt">Open Positions</div>
+    <div id="op"><div class="empty">loading…</div></div>
+    <div class="rb"><div class="rf" id="rf" style="width:0%;background:#00e676"></div></div>
+    <div style="font-size:10px;color:#2a4050;margin-top:5px" id="rl2"></div>
+  </div>
+  <div class="panel">
+    <div class="pt">Closed Trades</div>
+    <div id="ct"><div class="empty">loading…</div></div>
+  </div>
+</div>
+<div class="full">
+  <div class="pt">Bot Log (live · refreshes every 10s)</div>
+  <div class="log" id="lg">loading…</div>
+</div>
+<script>
+const C=100000;
+function color(l){
+  if(l.includes('◈')||l.includes('WIN')||l.includes('+₹')||l.includes('SETUP')) return 'g';
+  if(l.includes('ERROR')||l.includes('SL_HIT')||l.includes('-₹')) return 'r';
+  if(l.includes('WARNING')||l.includes('HOLD')||l.includes('TIME')) return 'a';
+  if(l.includes('Cycle')||l.includes('Scan')||l.includes('Progress')) return 'b';
+  return 'd';
+}
+async function refresh(){
+  try{
+    const d=await(await fetch('/api/status')).json();
+    const s=d.stats;
+    document.getElementById('st').textContent=d.time;
+    document.getElementById('rl').style.color='#00e676';
+    // metrics
+    document.getElementById('mp').textContent='₹'+(C+s.pnl).toLocaleString('en-IN');
+    const mw=document.getElementById('mw');
+    mw.textContent=(s.pnl>=0?'+₹':'-₹')+Math.abs(s.pnl).toLocaleString('en-IN');
+    mw.className='mv '+(s.pnl>=0?'g':'r');
+    document.getElementById('mws').textContent=((s.pnl/C)*100).toFixed(2)+'% of capital';
+    const tot=s.wins+s.losses;
+    document.getElementById('mwr').textContent=tot?Math.round(s.wins/tot*100)+'%':'—';
+    document.getElementById('mwrs').textContent=s.wins+'W / '+s.losses+'L';
+    const rp=Math.round(s.risk_used/3000*100);
+    const mr=document.getElementById('mr');
+    mr.textContent=rp+'%';
+    mr.className='mv '+(rp>80?'r':rp>50?'a':'a');
+    document.getElementById('mrs').textContent='₹'+s.risk_used+' / ₹3,000';
+    document.getElementById('mo').textContent=d.open.length;
+    // risk bar
+    const rf=document.getElementById('rf');
+    rf.style.width=Math.min(100,rp)+'%';
+    rf.style.background=rp>80?'#ff5252':rp>50?'#ffab40':'#00e676';
+    document.getElementById('rl2').textContent='Risk: ₹'+s.risk_used+' used of ₹3,000 weekly budget';
+    // open trades
+    document.getElementById('op').innerHTML=d.open.length?d.open.map(t=>
+      `<div class="tc open"><div class="tr"><span class="ts">${t.sym} <span style="font-size:9px;color:#3a5060">BUY</span></span><span class="tp o">OPEN</span></div>
+       <div class="tm">Entry ₹${t.entry} · SL ₹${t.sl} · TGT ₹${t.target}<br>R:R ${t.rr}x · Risk ₹${t.risk_amt} · Day ${t.days_held}/${5}</div></div>`
+    ).join(''):'<div class="empty">No open positions</div>';
+    // closed
+    document.getElementById('ct').innerHTML=d.closed.length?d.closed.map(t=>
+      `<div class="tc ${t.status}"><div class="tr"><span class="ts">${t.sym}</span>
+       <span class="tp ${t.pnl>=0?'p':'n'}">${t.pnl>=0?'+₹':'-₹'}${Math.abs(t.pnl)}</span></div>
+       <div class="tm">${t.exit_reason||t.status} · Entry ₹${t.entry}</div></div>`
+    ).join(''):'<div class="empty">No closed trades yet</div>';
+    // log
+    document.getElementById('lg').innerHTML=d.logs.map(l=>
+      `<div class="${color(l)}">${l}</div>`).join('');
+  }catch(e){document.getElementById('rl').style.color='#ff5252';}
+}
+refresh(); setInterval(refresh,10000);
+</script></body></html>"""
+
+    @app.route("/")
+    def index():
+        return render_template_string(DASH_HTML)
+
+    @app.route("/api/status")
+    def status():
+        try:
+            con = sqlite3.connect(DB)
+            con.row_factory = sqlite3.Row
+            ws = (date.today()-timedelta(days=date.today().weekday())).isoformat()
+            con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)",(ws,))
+            con.commit()
+            s = dict(con.execute(
+                "SELECT pnl,risk_used,wins,losses,time_exits FROM weekly_stats WHERE week_start=?",(ws,)
+            ).fetchone() or {"pnl":0,"risk_used":0,"wins":0,"losses":0,"time_exits":0})
+            open_t  = [dict(r) for r in con.execute(
+                "SELECT sym,entry,sl,target,rr,risk_amt,days_held FROM trades WHERE status='open'"
+            ).fetchall()]
+            closed  = [dict(r) for r in con.execute(
+                "SELECT sym,entry,pnl,status,exit_reason FROM trades WHERE status!='open' ORDER BY closed_at DESC LIMIT 15"
+            ).fetchall()]
+            con.close()
+            logs = []
+            try:
+                with open("claudebot.log") as f:
+                    logs = [l.strip() for l in f.readlines()[-50:]][::-1]
+            except Exception:
+                logs = ["Log file not yet created — bot starting up"]
+            return jsonify({"stats":s,"open":open_t,"closed":closed,"logs":logs,
+                            "time":datetime.now().strftime("%H:%M:%S")})
+        except Exception as e:
+            return jsonify({"error":str(e),"stats":{"pnl":0,"risk_used":0,"wins":0,"losses":0},
+                            "open":[],"closed":[],"logs":[],"time":"--:--:--"})
+
+    port = int(os.environ.get("PORT", 8000))
+    log.info(f"Dashboard starting on port {port}")
+    # Run Flask in a daemon thread so it doesn't block the bot
+    t = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False),
+        daemon=True
+    )
+    t.start()
+
 if __name__ == "__main__":
-    run()
+    start_dashboard()   # starts web server in background thread
+    run()               # runs bot in main thread
