@@ -1160,17 +1160,6 @@ setInterval(refresh, 10000);
     def index():
         return render_template_string(DASH_HTML)
 
-
-    @app.route("/health")
-    def health():
-        """Railway health check — keeps container alive."""
-        return {"status": "ok", "bot": "First-Orbit Trader PRO"}, 200
-
-    @app.route("/ping")
-    def ping():
-        """Simple ping for uptime monitors."""
-        return "pong", 200
-
     @app.route("/health")
     def health():
         """Railway health check endpoint — keeps container alive."""
