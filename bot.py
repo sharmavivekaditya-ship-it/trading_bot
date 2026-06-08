@@ -82,7 +82,7 @@ ATR_PERIOD       = 14
 ATR_STOP_MULT    = 2.0        # hard stop = entry − 2×ATR
 
 # Divergence detection
-DIVERGENCE_LOOKBACK = 5       # bars to look back for RSI divergence
+DIVERGENCE_LOOKBACK = 10      # bars to look back for RSI divergence (2 weeks)
 
 NSE_CSV = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
@@ -514,7 +514,7 @@ def check_rsi_divergence(sym: str, lookback: int = 5) -> tuple[bool, str]:
         rsi_high   = max(rsi_list[-(lookback+1):-1])  # highest recent RSI
 
         # Bearish divergence: price >= recent high BUT RSI < recent RSI high
-        if price_now >= price_prev * 1.01 and rsi_now < rsi_high * 0.97:
+        if price_now >= price_prev * 1.02 and rsi_now < rsi_high * 0.95:
             return True, f"price+{((price_now/price_prev-1)*100):.1f}% rsi-{(rsi_high-rsi_now):.1f}pts"
 
         return False, "no divergence"
@@ -587,8 +587,8 @@ def manage_positions(con) -> None:
             except Exception:
                 pass
 
-        # Exit 4: bearish RSI divergence
-        if not exit_reason:
+        # Exit 4: bearish RSI divergence (only after 2+ days — avoid noise on day 0)
+        if not exit_reason and days >= 2:
             div, desc = check_rsi_divergence(t["sym"], DIVERGENCE_LOOKBACK)
             if div:
                 exit_reason = f"DIVERGENCE({desc})"
@@ -1160,6 +1160,27 @@ setInterval(refresh, 10000);
     def index():
         return render_template_string(DASH_HTML)
 
+
+    @app.route("/health")
+    def health():
+        """Railway health check — keeps container alive."""
+        return {"status": "ok", "bot": "First-Orbit Trader PRO"}, 200
+
+    @app.route("/ping")
+    def ping():
+        """Simple ping for uptime monitors."""
+        return "pong", 200
+
+    @app.route("/health")
+    def health():
+        """Railway health check endpoint — keeps container alive."""
+        return {"status": "ok", "bot": "First-Orbit Trader PRO"}, 200
+
+    @app.route("/ping")
+    def ping():
+        """Simple ping for uptime monitors (UptimeRobot etc.)."""
+        return "pong", 200
+
     @app.route("/api/status")
     def status():
         try:
@@ -1207,5 +1228,23 @@ setInterval(refresh, 10000);
     t.start()
 
 if __name__ == "__main__":
+    import threading, urllib.request as _ur
+
     start_dashboard()   # starts web server in background thread
+
+    # Keep-alive thread — pings own /health every 4 minutes
+    # Prevents Railway from considering the service idle
+    def _keepalive():
+        import time as _t
+        _t.sleep(30)   # wait for Flask to start
+        port = int(_os.environ.get("PORT", 8080))
+        while True:
+            try:
+                _ur.urlopen(f"http://127.0.0.1:{port}/health", timeout=5)
+            except Exception:
+                pass
+            _t.sleep(240)   # ping every 4 min
+
+    threading.Thread(target=_keepalive, daemon=True).start()
+
     run()               # runs bot in main thread
