@@ -1,2 +1,1 @@
-worker: python bot.py
-web: python dashboard.py
+web: python dashboard.py & python bot.py
