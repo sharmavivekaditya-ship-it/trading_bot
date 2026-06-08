@@ -1,35 +1,41 @@
 """
-ClaudeBot v2 — Full NSE Market Scanner
-Scans entire NSE universe → multi-stage algo filter → Claude signal → auto trade
+ClaudeBot v3 — Pure Algo NSE Swing Trader
+NO AI / NO API CALLS — fully deterministic rule-based strategy
 
-DATA:  yfinance (free, no API key)
-UNIVERSE: NSE EQUITY_L.csv (~2000 stocks) → filtered to liquid mid/large caps
-PIPELINE:
-  Stage 1 — Liquidity filter     (price, volume, market cap proxy) — zero API cost
-  Stage 2 — Technical screener   (RSI, EMA trend, volume surge, ATR) — zero API cost
-  Stage 3 — Momentum scorer      (ranks survivors by composite score) — zero API cost
-  Stage 4 — Claude signal        (top N candidates only) — Haiku, ~80 tokens each
-  Stage 5 — Risk-sized execution (paper or live broker)
+STRATEGY: RSI Mean-Reversion in Uptrend + ATR-based sizing
+─────────────────────────────────────────────────────────────
+UNIVERSE:  NSE EQUITY_L.csv → liquidity filter (~400 stocks)
+ENTRY:     RSI(14) crosses above 32 from oversold
+           + Price > EMA50 (uptrend)
+           + EMA20 > EMA50 (momentum)
+           + Volume > 1.5x 20d avg (institutional)
+           + ATR% 1.5–5% (swingable range)
+STOP:      Entry − 1.5 × ATR  (volatility-adjusted)
+TARGET:    Entry + 3.0 × ATR  (2:1 R:R guaranteed)
+TRAIL:     Move stop to breakeven once price + 1×ATR
+TIME EXIT: Force close after 5 trading days
+SIZING:    qty = RISK_PER_TRADE / (entry − stop)
+RANK:      Composite score → top 3 per cycle
 """
 
-import time, json, sqlite3, os, logging, math, io
+import time, json, sqlite3, os, logging, io, math
 from datetime import datetime, date, timedelta
-import urllib.request, urllib.error
+import urllib.request
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     handlers=[logging.FileHandler("claudebot.log"), logging.StreamHandler()]
 )
-log = logging.getLogger("claudebot")
+log = logging.getLogger("bot")
 
-# ── INSTALL DEPS AT RUNTIME IF MISSING ───────────────────────────────────────
+# ── INSTALL DEPS ──────────────────────────────────────────────────────────────
 def ensure_deps():
     import importlib, subprocess, sys
-    for pkg, imp in [("yfinance","yfinance"), ("pandas","pandas"), ("numpy","numpy")]:
-        try: importlib.import_module(imp)
+    for pkg in ["yfinance", "pandas", "numpy"]:
+        try: importlib.import_module(pkg)
         except ImportError:
-            log.info(f"Installing {pkg}...")
+            log.info(f"pip install {pkg}…")
             subprocess.check_call([sys.executable,"-m","pip","install",pkg,"-q"])
 ensure_deps()
 
@@ -40,78 +46,33 @@ import numpy as np
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 CAPITAL          = 100_000
 MAX_WEEKLY_RISK  = 3_000
-RISK_PER_TRADE   = 800
-MIN_RR           = 2.0
-MAX_OPEN         = 3
-SCAN_INTERVAL    = 300          # 5 min between full scan cycles
-TOP_N_FOR_CLAUDE = 5            # only top N algo-ranked stocks sent to Claude
-HOLD_SKIP_CYCLES = 6
+RISK_PER_TRADE   = 800        # ₹ risked per trade
+MAX_OPEN         = 3          # max concurrent positions
+SCAN_INTERVAL    = 300        # seconds between cycles (5 min)
+TOP_N            = 3          # take top N ranked setups per cycle
 
-# Liquidity thresholds (Stage 1)
-MIN_PRICE        = 50           # skip penny stocks
-MAX_PRICE        = 10_000       # skip stocks too expensive to buy qty>1
-MIN_AVG_VOLUME   = 200_000      # avg daily volume
+# Liquidity gates
+MIN_PRICE        = 100
+MAX_PRICE        = 8_000
+MIN_AVG_VOL      = 300_000    # shares/day
 
-# NSE symbol list URL (official NSE CSV)
-NSE_EQUITY_CSV   = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+# Strategy parameters
+RSI_PERIOD       = 14
+RSI_ENTRY        = 32         # RSI must cross UP through this
+RSI_EXIT_OB      = 72         # exit if RSI hits overbought
+EMA_FAST         = 20
+EMA_SLOW         = 50
+VOL_MULTIPLIER   = 1.5        # volume must be this × 20d avg
+ATR_PERIOD       = 14
+ATR_MIN_PCT      = 1.5        # min daily range % (too quiet = skip)
+ATR_MAX_PCT      = 5.0        # max daily range % (too wild = skip)
+ATR_STOP_MULT    = 1.5        # stop = entry − N×ATR
+ATR_TARGET_MULT  = 3.0        # target = entry + N×ATR  → R:R = 2.0
+TIME_STOP_DAYS   = 5          # force exit after N trading days
 
-# ── DB ────────────────────────────────────────────────────────────────────────
-def init_db():
-    con = sqlite3.connect("trades.db")
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS trades (
-        id TEXT PRIMARY KEY, sym TEXT, direction TEXT,
-        entry REAL, sl REAL, target REAL,
-        qty INTEGER, risk_amt REAL, target_gain REAL,
-        rr REAL, status TEXT DEFAULT 'open', pnl REAL DEFAULT 0,
-        score REAL DEFAULT 0,
-        opened_at TEXT, closed_at TEXT, claude_reason TEXT
-    );
-    CREATE TABLE IF NOT EXISTS scan_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts TEXT, sym TEXT, signal TEXT, rr REAL,
-        skipped INTEGER DEFAULT 0, model_used TEXT,
-        tokens_used INTEGER DEFAULT 0, algo_score REAL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS weekly_stats (
-        week_start TEXT PRIMARY KEY,
-        pnl REAL DEFAULT 0, risk_used REAL DEFAULT 0,
-        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
-        total_tokens INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS screener_cache (
-        sym TEXT PRIMARY KEY, score REAL, rsi REAL,
-        trend TEXT, vol_ratio REAL, atr_pct REAL,
-        price REAL, updated_at TEXT
-    );
-    """)
-    con.commit()
-    return con
+NSE_CSV = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
-# ── STAGE 1: GET NSE UNIVERSE ─────────────────────────────────────────────────
-def fetch_nse_universe() -> list[str]:
-    """
-    Download NSE's official equity list and return liquid symbols.
-    Falls back to a curated Nifty 200 list if the CSV download fails.
-    """
-    try:
-        req = urllib.request.Request(
-            NSE_EQUITY_CSV,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("latin-1")
-        df = pd.read_csv(io.StringIO(raw))
-        # NSE CSV has column "SYMBOL"
-        syms = df["SYMBOL"].dropna().tolist()
-        log.info(f"NSE universe loaded: {len(syms)} symbols")
-        return syms
-    except Exception as e:
-        log.warning(f"NSE CSV fetch failed ({e}) — using Nifty 200 fallback")
-        return NIFTY200_FALLBACK
-
-# Curated Nifty 200 fallback (used if NSE CSV unreachable)
-NIFTY200_FALLBACK = [
+NIFTY500_FALLBACK = [
     "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","SBIN","BHARTIARTL",
     "KOTAKBANK","ITC","LT","AXISBANK","ASIANPAINT","MARUTI","SUNPHARMA","TATAMOTORS",
     "ULTRACEMCO","WIPRO","NESTLEIND","POWERGRID","NTPC","TECHM","HCLTECH","BAJFINANCE",
@@ -120,372 +81,462 @@ NIFTY200_FALLBACK = [
     "BRITANNIA","EICHERMOT","HEROMOTOCO","M&M","APOLLOHOSP","TATACONSUM","DABUR",
     "PIDILITIND","BERGEPAINT","LUPIN","TORNTPHARM","MUTHOOTFIN","CHOLAFIN","SBILIFE",
     "HDFCLIFE","ICICIGI","BANDHANBNK","FEDERALBNK","IDFCFIRSTB","PNB","CANBK","BANKBARODA",
-    "MOTHERSON","BALKRISIND","PERSISTENT","LTIM","MPHASIS","COFORGE","ZOMATO","NYKAA",
-    "DELHIVERY","PAYTM","POLICYBZR","IRCTC","GMRINFRA","ADANIENT","ADANITRANS",
-    "ADANIGREEN","ADANIPOWER","TATAPOWER","TORNTPOWER","CESC","IEX","PFC","RECLTD",
-    "NHPC","SJVN","IRFC","HUDCO","RVNL","RAILTEL","NBCC","BEL","HAL","BHEL","SAIL",
-    "NMDC","MOIL","NATIONALUM","VEDL","HINDCOPPER","RATNAMANI","APL","JINDALSTEL",
-    "WELCORP","APLAPOLLO","POLYCAB","HAVELLS","VOLTAS","BLUESTAR","CROMPTON","KEI",
-    "SCHNEIDER","ABB","SIEMENS","CUMMINSIND","THERMAX","KSB","GRINDWELL","TIMKEN",
-    "SCHAEFFLER","SKFINDIA","FINCABLES","GMMPFAUDLR","TDPOWERSYS","ELECON","ISGEC",
+    "MOTHERSON","BALKRISIND","PERSISTENT","LTIM","MPHASIS","COFORGE","ZOMATO","IRCTC",
+    "TATAPOWER","TORNTPOWER","PFC","RECLTD","NHPC","IRFC","BEL","HAL","BHEL","SAIL",
+    "NMDC","VEDL","POLYCAB","HAVELLS","VOLTAS","ABB","SIEMENS","CUMMINSIND","THERMAX",
+    "DIXON","AMBER","KAYNES","SYRMA","TATAELXSI","KPITTECH","CYIENT","LTTS","HAPPSTMNDS",
+    "INTELLECT","MASTEK","HEXAWARE","OFSS","NIITTECH","RATEGAIN","ZENSAR","BIRLASOFT",
+    "SONACOMS","SCHAEFFLER","TIMKEN","GRINDWELL","FINCABLES","SUPREMEIND","ASTRAL",
+    "PRINCEPIPE","FINOLEX","NILKAMAL","GREENPLY","CENTURYPLY","GREENPANEL","CENTURY",
+    "JKCEMENT","RAMCOCEM","HEIDELBERG","ORIENTCEM","NUVOCO","BIRLACORPN","DALMIACEM",
+    "STARCEMENT","MANGCMFG","PRSMJOHNSN","KAJARIA","SOMANYCER","CERA","HSIL",
+    "APLAPOLLO","RATNAMANI","APL","JINDALSTEL","WELCORP","TINPLATE","MSTC",
+    "BALRAMCHIN","TRIVENI","EIDPARRY","DHAMPUR","UTTAMSUGAR","RENUKA","GMRINFRA",
+    "ADANIENT","ADANITRANS","ADANIGREEN","ADANIPOWER","ATGL","APSEZ","ADANIPORTS",
+    "NYKAA","DELHIVERY","PAYTM","POLICYBZR","CARTRADE","EASEMYTRIP","IXIGO",
+    "DEVYANI","SAPPHIRE","JUBLFOOD","WESTLIFE","BARBEQUE","EAZYDINER",
+    "PAGEIND","MANYAVAR","VEDANT","ABFRL","TRENT","SHOPERSTOP","VLCL","METRO",
+    "RAJESHEXPO","KALYANKJIL","SENCO","PCJEWELLER","GITANJALI",
+    "APOLLOTYRE","MRF","CEAT","GOODYEAR","TVS","BAJAJ-AUTO","TVSMOTOR","ESCORTS",
+    "FORCEMOT","ASHOKLEY","VOLVO","SML","TIINDIA","SUPRAJIT","ENDURANCE","MINDA",
+    "SANDHAR","GABRIAL","UCAL","SHARDAMOTR","MINDAIND","SUNDRM","WABCO","SUBROS",
+    "ALKEM","AUROPHARMA","CADILAHC","IPCA","NATCOPHARM","GRANULES","AJANTPHARM",
+    "LAUREATE","SEQUENT","LAURUS","SUVEN","SOLARA","HIKAL","NEULANDLAB","DIVI",
+    "BIOCON","STRIDES","GLAND","PHIBRO","PFIZER","SANOFI","ABBOT","GLAXO","NOVARTIS",
 ]
 
-# ── STAGE 2 & 3: TECHNICAL SCREENER + MOMENTUM SCORER ────────────────────────
-def compute_indicators(sym: str) -> dict | None:
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+def init_db():
+    con = sqlite3.connect("trades.db")
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS trades (
+        id TEXT PRIMARY KEY,
+        sym TEXT, direction TEXT,
+        entry REAL, sl REAL, target REAL, trail_sl REAL,
+        qty INTEGER, risk_amt REAL, target_gain REAL,
+        rr REAL, status TEXT DEFAULT 'open',
+        pnl REAL DEFAULT 0, score REAL DEFAULT 0,
+        days_held INTEGER DEFAULT 0,
+        opened_at TEXT, closed_at TEXT, exit_reason TEXT
+    );
+    CREATE TABLE IF NOT EXISTS scan_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT, sym TEXT, signal TEXT,
+        score REAL, rsi REAL, atr_pct REAL,
+        entry REAL, sl REAL, target REAL, rr REAL
+    );
+    CREATE TABLE IF NOT EXISTS weekly_stats (
+        week_start TEXT PRIMARY KEY,
+        pnl REAL DEFAULT 0, risk_used REAL DEFAULT 0,
+        wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0,
+        time_exits INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS screener_cache (
+        sym TEXT PRIMARY KEY,
+        score REAL, rsi REAL, rsi_prev REAL,
+        trend TEXT, vol_ratio REAL, atr REAL, atr_pct REAL,
+        price REAL, ema20 REAL, ema50 REAL,
+        entry REAL, sl REAL, target REAL, rr REAL,
+        updated_at TEXT
+    );
+    """)
+    con.commit()
+    return con
+
+# ── FETCH NSE UNIVERSE ────────────────────────────────────────────────────────
+def fetch_universe() -> list[str]:
+    try:
+        req = urllib.request.Request(NSE_CSV, headers={"User-Agent":"Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            df = pd.read_csv(io.StringIO(r.read().decode("latin-1")))
+        syms = df["SYMBOL"].dropna().str.strip().tolist()
+        log.info(f"NSE universe: {len(syms)} symbols")
+        return syms
+    except Exception as e:
+        log.warning(f"NSE CSV failed ({e}) — using {len(NIFTY500_FALLBACK)}-stock fallback")
+        return NIFTY500_FALLBACK
+
+# ── INDICATOR ENGINE ──────────────────────────────────────────────────────────
+def rsi(close: np.ndarray, period=14) -> np.ndarray:
+    delta = np.diff(close.astype(float))
+    gain  = np.where(delta > 0, delta, 0.0)
+    loss  = np.where(delta < 0, -delta, 0.0)
+    avg_g = np.convolve(gain, np.ones(period)/period, mode='valid')
+    avg_l = np.convolve(loss, np.ones(period)/period, mode='valid')
+    rs    = np.divide(avg_g, avg_l, out=np.ones_like(avg_g)*100, where=avg_l!=0)
+    return 100 - (100 / (1 + rs))
+
+def ema(close: np.ndarray, span: int) -> float:
+    return float(pd.Series(close).ewm(span=span, adjust=False).mean().iloc[-1])
+
+def atr(high, low, close, period=14) -> float:
+    h, l, c = high[1:], low[1:], close[:-1]
+    tr = np.maximum(h-l, np.maximum(np.abs(h-c), np.abs(l-c)))
+    return float(np.mean(tr[-period:]))
+
+# ── CORE SCREENER ─────────────────────────────────────────────────────────────
+def screen_symbol(sym: str) -> dict | None:
     """
-    Download 60 days of daily OHLCV for one symbol.
-    Compute: RSI-14, EMA20/EMA50, volume ratio, ATR%, price.
-    Returns None if data insufficient or stock fails liquidity filter.
+    Download 90 days OHLCV, apply all filters, compute score.
+    Returns setup dict if valid entry signal, else None.
     """
     try:
-        ticker = yf.Ticker(sym + ".NS")
-        df = ticker.history(period="60d", interval="1d", timeout=10)
-        if df is None or len(df) < 20:
+        df = yf.Ticker(sym+".NS").history(period="90d", interval="1d", timeout=10)
+        if df is None or len(df) < EMA_SLOW + 5:
             return None
 
-        close = df["Close"].values
-        volume = df["Volume"].values
-        high = df["High"].values
-        low = df["Low"].values
-        price = float(close[-1])
+        c = df["Close"].values.astype(float)
+        h = df["High"].values.astype(float)
+        l = df["Low"].values.astype(float)
+        v = df["Volume"].values.astype(float)
 
-        # Stage 1: liquidity
-        avg_vol = float(np.mean(volume[-20:]))
-        if price < MIN_PRICE or price > MAX_PRICE or avg_vol < MIN_AVG_VOLUME:
+        price     = c[-1]
+        avg_vol   = float(np.mean(v[-20:]))
+        today_vol = float(v[-1])
+
+        # ── STAGE 1: LIQUIDITY GATE ───────────────────────────────────────
+        if price < MIN_PRICE or price > MAX_PRICE:
+            return None
+        if avg_vol < MIN_AVG_VOL:
             return None
 
-        # RSI-14
-        delta = np.diff(close)
-        gain = np.where(delta > 0, delta, 0)
-        loss = np.where(delta < 0, -delta, 0)
-        avg_gain = np.mean(gain[-14:])
-        avg_loss = np.mean(loss[-14:])
-        rsi = 100 - (100 / (1 + avg_gain / avg_loss)) if avg_loss > 0 else 100
+        # ── COMPUTE INDICATORS ────────────────────────────────────────────
+        rsi_arr  = rsi(c, RSI_PERIOD)
+        rsi_now  = float(rsi_arr[-1])
+        rsi_prev = float(rsi_arr[-2])
+        ema20    = ema(c, EMA_FAST)
+        ema50    = ema(c, EMA_SLOW)
+        atr_val  = atr(h, l, c, ATR_PERIOD)
+        atr_pct  = atr_val / price * 100
+        vol_ratio = today_vol / avg_vol
 
-        # EMA trend
-        ema20 = float(pd.Series(close).ewm(span=20, adjust=False).mean().iloc[-1])
-        ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
-        if price > ema20 > ema50:
-            trend = "Uptrend"
-        elif price < ema20 < ema50:
-            trend = "Downtrend"
-        elif price > ema50 and ema20 > ema50:
-            trend = "Recovering"
-        else:
-            trend = "Sideways"
+        # ── STAGE 2: ENTRY SIGNAL CONDITIONS ─────────────────────────────
+        # Condition A — RSI CROSS: was below entry threshold, now above
+        rsi_cross = (rsi_prev < RSI_ENTRY) and (rsi_now >= RSI_ENTRY)
+        # Condition B — UPTREND confirmed
+        uptrend   = (price > ema50) and (ema20 > ema50)
+        # Condition C — VOLUME surge
+        vol_surge = vol_ratio >= VOL_MULTIPLIER
+        # Condition D — ATR in swing-friendly range
+        atr_ok    = ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT
 
-        # Volume ratio (today vs 20d avg)
-        vol_ratio = float(volume[-1]) / avg_vol if avg_vol > 0 else 1.0
+        if not (rsi_cross and uptrend and vol_surge and atr_ok):
+            return None
 
-        # ATR% (volatility proxy — good for swing)
-        tr = np.maximum(high[1:]-low[1:],
-             np.maximum(abs(high[1:]-close[:-1]), abs(low[1:]-close[:-1])))
-        atr = float(np.mean(tr[-14:]))
-        atr_pct = atr / price * 100
+        # ── COMPUTE LEVELS ────────────────────────────────────────────────
+        entry  = round(price, 2)
+        sl     = round(entry - ATR_STOP_MULT * atr_val, 2)
+        target = round(entry + ATR_TARGET_MULT * atr_val, 2)
+        rr     = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)   # always 2.0
 
-        # ── MOMENTUM SCORE (0–100) ──────────────────────────────────────────
-        # Components:
-        #  RSI score   — oversold (30-45) = bullish setup = high score
-        #  Trend score — Uptrend/Recovering > Sideways > Downtrend
-        #  Volume score— surge (>1.5x) = institutional interest
-        #  ATR score   — sweet spot 1.5–4% daily range (good for swing)
+        # ── COMPOSITE SCORE (0–100) ───────────────────────────────────────
+        # RSI score: strongest signal just above 32 (fresh cross), weakens higher
+        rsi_score  = max(0, 100 - (rsi_now - RSI_ENTRY) * 4)
+        # Volume score: more surge = more conviction
+        vol_score  = min(100, (vol_ratio - VOL_MULTIPLIER) / 2 * 100)
+        # ATR score: 2.5% is ideal swing range
+        atr_score  = max(0, 100 - abs(atr_pct - 2.5) * 15)
+        # EMA gap score: bigger gap between ema20 and ema50 = stronger trend
+        ema_gap_pct = (ema20 - ema50) / ema50 * 100
+        trend_score = min(100, ema_gap_pct * 20)
 
-        # RSI: best buy zone 28–42, best sell zone 62–75
-        if 28 <= rsi <= 42:
-            rsi_score = 90 - (rsi - 28) * 2        # buy candidate
-            direction_hint = "BUY"
-        elif 62 <= rsi <= 75:
-            rsi_score = 90 - (rsi - 62) * 2        # sell/short candidate
-            direction_hint = "SELL"
-        elif 42 < rsi < 55:
-            rsi_score = 30                           # neutral
-            direction_hint = "HOLD"
-        else:
-            rsi_score = 10
-            direction_hint = "HOLD"
-
-        trend_score = {"Uptrend":85,"Recovering":65,"Sideways":20,"Downtrend":40}.get(trend, 20)
-        vol_score   = min(100, vol_ratio * 40)       # 2.5x volume = 100 pts
-        atr_score   = 100 - abs(atr_pct - 2.5) * 15  # ideal ~2.5% daily range
-        atr_score   = max(0, min(100, atr_score))
-
-        composite = (rsi_score*0.35 + trend_score*0.30 + vol_score*0.20 + atr_score*0.15)
+        score = (rsi_score * 0.35 + vol_score * 0.30 +
+                 trend_score * 0.20 + atr_score * 0.15)
 
         return {
-            "sym": sym,
-            "price": round(price, 2),
-            "rsi": round(rsi, 1),
-            "trend": trend,
+            "sym":      sym,
+            "price":    price,
+            "rsi":      round(rsi_now, 1),
+            "rsi_prev": round(rsi_prev, 1),
+            "ema20":    round(ema20, 2),
+            "ema50":    round(ema50, 2),
+            "atr":      round(atr_val, 2),
+            "atr_pct":  round(atr_pct, 2),
             "vol_ratio": round(vol_ratio, 2),
-            "atr_pct": round(atr_pct, 2),
-            "ema20": round(ema20, 2),
-            "ema50": round(ema50, 2),
-            "score": round(composite, 1),
-            "direction_hint": direction_hint,
-            "avg_vol": int(avg_vol),
+            "avg_vol":  int(avg_vol),
+            "entry":    entry,
+            "sl":       sl,
+            "target":   target,
+            "rr":       rr,
+            "score":    round(score, 1),
         }
+
     except Exception:
         return None
 
-def run_screener(universe: list[str], con) -> list[dict]:
+# ── FULL MARKET SCAN ──────────────────────────────────────────────────────────
+def scan_market(universe: list[str], con) -> list[dict]:
     """
-    Stage 2+3: Screen entire universe, return top N by momentum score.
-    Batched with delays to be polite to Yahoo Finance.
-    Caches results in DB to avoid re-fetching within same cycle.
+    Screen all symbols, cache results, return top N setups.
+    Skips symbols cached within last 4 hours (no fresh signal).
     """
-    log.info(f"Screening {len(universe)} symbols…")
-    results = []
-    batch_size = 20
-    now = datetime.now().isoformat()
+    log.info(f"Scanning {len(universe)} symbols…")
+    setups = []
+    cache_cutoff = (datetime.now() - timedelta(hours=4)).isoformat()
 
     for i, sym in enumerate(universe):
-        # Check cache (fresh within 4 hours)
+        # Check if we already have a cached setup for this symbol
         cached = con.execute(
-            "SELECT score,rsi,trend,vol_ratio,atr_pct,price FROM screener_cache WHERE sym=? AND updated_at>?",
-            (sym, (datetime.now()-timedelta(hours=4)).isoformat())
+            "SELECT score,rsi,rsi_prev,trend,vol_ratio,atr_pct,price,entry,sl,target,rr,atr "
+            "FROM screener_cache WHERE sym=? AND updated_at>? AND entry IS NOT NULL",
+            (sym, cache_cutoff)
         ).fetchone()
 
         if cached:
-            score, rsi, trend, vol_ratio, atr_pct, price = cached
-            if score >= 40:  # only keep cache hits above threshold
-                direction_hint = "BUY" if rsi < 45 else ("SELL" if rsi > 60 else "HOLD")
-                results.append({"sym":sym,"score":score,"rsi":rsi,"trend":trend,
-                                 "vol_ratio":vol_ratio,"atr_pct":atr_pct,"price":price,
-                                 "direction_hint":direction_hint})
+            score,rsi_n,rsi_p,trend,vol_r,atr_p,price,entry,sl,target,rr,atr_v = cached
+            setups.append({"sym":sym,"score":score,"rsi":rsi_n,"rsi_prev":rsi_p,
+                           "vol_ratio":vol_r,"atr_pct":atr_p,"price":price,
+                           "entry":entry,"sl":sl,"target":target,"rr":rr,"atr":atr_v})
             continue
 
-        data = compute_indicators(sym)
-        if data:
-            con.execute("""
-                INSERT OR REPLACE INTO screener_cache
-                (sym,score,rsi,trend,vol_ratio,atr_pct,price,updated_at)
-                VALUES (?,?,?,?,?,?,?,?)
-            """, (sym, data["score"], data["rsi"], data["trend"],
-                  data["vol_ratio"], data["atr_pct"], data["price"], now))
+        result = screen_symbol(sym)
+        now = datetime.now().isoformat()
+
+        if result:
+            con.execute("""INSERT OR REPLACE INTO screener_cache
+                (sym,score,rsi,rsi_prev,trend,vol_ratio,atr,atr_pct,
+                 price,ema20,ema50,entry,sl,target,rr,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (sym, result["score"], result["rsi"], result["rsi_prev"],
+                 "Uptrend", result["vol_ratio"], result["atr"], result["atr_pct"],
+                 result["price"], result["ema20"], result["ema50"],
+                 result["entry"], result["sl"], result["target"],
+                 result["rr"], now))
             con.commit()
-            if data["score"] >= 40:
-                results.append(data)
+            setups.append(result)
+            log.info(f"  ✓ SETUP: {sym} score:{result['score']} "
+                     f"RSI:{result['rsi_prev']}→{result['rsi']} "
+                     f"vol:{result['vol_ratio']}x atr:{result['atr_pct']}%")
+        else:
+            # Cache the miss too (avoid re-screening)
+            con.execute("INSERT OR REPLACE INTO screener_cache "
+                        "(sym,score,rsi,rsi_prev,trend,vol_ratio,atr,atr_pct,price,ema20,ema50,updated_at) "
+                        "VALUES (?,0,0,0,'',0,0,0,0,0,?,?)",
+                        (sym, 0, now))
+            if (i+1) % 100 == 0:
+                con.commit()
 
-        # Rate limiting — batch pause
-        if (i+1) % batch_size == 0:
-            time.sleep(2)
-            log.info(f"  Screened {i+1}/{len(universe)} — {len(results)} candidates so far…")
+        if (i+1) % 50 == 0:
+            log.info(f"  Progress: {i+1}/{len(universe)} scanned, {len(setups)} setups found")
+            time.sleep(1)   # gentle rate limiting
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    log.info(f"Screener done: {len(results)} candidates → top {TOP_N_FOR_CLAUDE} to Claude")
-    return results[:TOP_N_FOR_CLAUDE]
+    setups.sort(key=lambda x: x["score"], reverse=True)
+    top = setups[:TOP_N]
+    log.info(f"Scan complete: {len(setups)} setups → top {len(top)} selected")
+    for s in top:
+        log.info(f"  #{setups.index(s)+1} {s['sym']} score:{s['score']} "
+                 f"entry:₹{s['entry']} sl:₹{s['sl']} tgt:₹{s['target']} R:R:{s['rr']}x")
+    return top
 
-# ── STAGE 4: CREDIT-EFFICIENT CLAUDE ─────────────────────────────────────────
-class Claude:
-    def __init__(self):
-        from anthropic import Anthropic
-        self.client = Anthropic()
-        self.hold_cache = {}
-        self.total_tokens = 0
+# ── POSITION MANAGEMENT ───────────────────────────────────────────────────────
+def manage_positions(con) -> None:
+    """
+    For each open trade:
+    1. Fetch latest price via yfinance
+    2. Update trailing stop (move to breakeven once price > entry + 1×ATR)
+    3. Check SL / target / time stop
+    4. RSI overbought exit
+    """
+    open_trades = con.execute("SELECT * FROM trades WHERE status='open'").fetchall()
+    cols = ["id","sym","direction","entry","sl","target","trail_sl","qty",
+            "risk_amt","target_gain","rr","status","pnl","score","days_held",
+            "opened_at","closed_at","exit_reason"]
 
-    def get_signal(self, stock: dict, risk_remaining: float) -> dict:
-        if self.hold_cache.get(stock["sym"], 0) > 0:
-            self.hold_cache[stock["sym"]] -= 1
-            return {"signal":"SKIP","reason":"hold cache","tokens":0,"model":"none"}
+    for row in open_trades:
+        t = dict(zip(cols, row))
 
-        prompt = (
-            f"NSE swing trade. JSON only, no markdown.\n"
-            f"{stock['sym']} ₹{stock['price']} RSI:{stock['rsi']} "
-            f"trend:{stock['trend']} vol:{stock['vol_ratio']}x ATR:{stock['atr_pct']}% "
-            f"algo_score:{stock['score']}/100 hint:{stock['direction_hint']}\n"
-            f"Risk:₹{risk_remaining:.0f} min_rr:{MIN_RR} hold:2-5days\n"
-            f"{{\"signal\":\"BUY\"|\"SELL\"|\"HOLD\","
-            f"\"entry\":N,\"sl\":N,\"target\":N,\"rr\":N,\"reason\":\"<8 words\"}}"
-        )
-        resp = self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=100,
-            messages=[{"role":"user","content":prompt}]
-        )
-        tok = resp.usage.input_tokens + resp.usage.output_tokens
-        self.total_tokens += tok
-        raw = resp.content[0].text.strip().replace("```json","").replace("```","").strip()
-        data = json.loads(raw)
-        if data.get("signal") == "HOLD":
-            self.hold_cache[stock["sym"]] = HOLD_SKIP_CYCLES
-        data["tokens"] = tok
-        data["model"] = "haiku"
-        return data
+        # Fetch live price
+        try:
+            hist = yf.Ticker(t["sym"]+".NS").history(period="2d", interval="5m", timeout=8)
+            price = float(hist["Close"].iloc[-1]) if len(hist) > 0 else None
+        except Exception:
+            price = None
 
-    def check_exit(self, trade: dict, price: float) -> dict:
-        pnl = (price-trade["entry"])*trade["qty"] if trade["direction"]=="BUY" \
-              else (trade["entry"]-price)*trade["qty"]
-        model = "claude-sonnet-4-20250514" if pnl > trade["risk_amt"] else "claude-haiku-4-5-20251001"
-        resp = self.client.messages.create(
-            model=model, max_tokens=60,
-            messages=[{"role":"user","content":
-                f"Exit? JSON {{\"action\":\"EXIT\"|\"HOLD\",\"reason\":\"<6 words\"}}\n"
-                f"{trade['direction']} {trade['sym']} entry:₹{trade['entry']} "
-                f"sl:₹{trade['sl']} tgt:₹{trade['target']} now:₹{price:.2f} pnl:₹{pnl:.0f}"}]
-        )
-        tok = resp.usage.input_tokens + resp.usage.output_tokens
-        self.total_tokens += tok
-        raw = resp.content[0].text.strip().replace("```json","").replace("```","")
-        data = json.loads(raw.strip())
-        data["tokens"] = tok
-        data["pnl"] = pnl
-        return data
+        if price is None:
+            log.warning(f"  Price fetch failed for {t['sym']} — skipping")
+            continue
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def week_start():
+        # Update days held
+        try:
+            opened = datetime.fromisoformat(t["opened_at"])
+            days = (datetime.now() - opened).days
+        except Exception:
+            days = 0
+        con.execute("UPDATE trades SET days_held=? WHERE id=?", (days, t["id"]))
+
+        # ── TRAILING STOP ─────────────────────────────────────────────────
+        # Once price crosses entry + 1×ATR, move stop to breakeven
+        atr_val = abs(t["entry"] - t["sl"]) / ATR_STOP_MULT
+        be_trigger = t["entry"] + atr_val   # breakeven trigger level
+        if price >= be_trigger and t["trail_sl"] < t["entry"]:
+            new_trail = t["entry"]
+            con.execute("UPDATE trades SET trail_sl=? WHERE id=?", (new_trail, t["id"]))
+            con.commit()
+            log.info(f"  TRAIL {t['sym']}: stop moved to breakeven ₹{new_trail}")
+            t["trail_sl"] = new_trail
+
+        effective_sl = max(t["sl"], t["trail_sl"])
+
+        # ── EXIT CONDITIONS ───────────────────────────────────────────────
+        exit_reason = None
+        if price <= effective_sl:
+            exit_reason = "SL_HIT"
+        elif price >= t["target"]:
+            exit_reason = "TARGET_HIT"
+        elif days >= TIME_STOP_DAYS:
+            exit_reason = "TIME_STOP"
+        else:
+            # RSI overbought exit
+            try:
+                df = yf.Ticker(t["sym"]+".NS").history(period="30d", interval="1d", timeout=8)
+                if len(df) >= RSI_PERIOD + 2:
+                    rsi_arr = rsi(df["Close"].values, RSI_PERIOD)
+                    if float(rsi_arr[-1]) >= RSI_EXIT_OB:
+                        exit_reason = f"RSI_OB({float(rsi_arr[-1]):.0f})"
+            except Exception:
+                pass
+
+        if exit_reason:
+            pnl = round((price - t["entry"]) * t["qty"], 2)
+            status = "win" if pnl > 0 else "loss"
+            con.execute("UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=? WHERE id=?",
+                        (status, pnl, datetime.now().isoformat(), exit_reason, t["id"]))
+            con.commit()
+            _upd_stats(con, pnl=pnl, risk_used=abs(pnl) if pnl<0 else 0,
+                       wins=1 if pnl>0 else 0, losses=0 if pnl>0 else 1,
+                       time_exits=1 if exit_reason=="TIME_STOP" else 0)
+            log.info(f"  CLOSED {t['sym']} [{exit_reason}] @ ₹{price:.2f} P&L ₹{pnl:+.0f}")
+        else:
+            log.info(f"  HOLD {t['sym']} @ ₹{price:.2f} "
+                     f"(entry ₹{t['entry']} SL ₹{effective_sl:.2f} TGT ₹{t['target']}) "
+                     f"days:{days}/{TIME_STOP_DAYS}")
+
+# ── EXECUTE PAPER ORDER ───────────────────────────────────────────────────────
+def execute_order(setup: dict, con, risk_remaining: float) -> bool:
+    entry     = setup["entry"]
+    sl        = setup["sl"]
+    risk_per  = abs(entry - sl)
+    if risk_per <= 0: return False
+    qty = max(1, int(min(risk_remaining, RISK_PER_TRADE) / risk_per))
+    actual_risk  = round(qty * risk_per, 2)
+    target_gain  = round(qty * abs(entry - setup["target"]), 2)
+
+    tid = f"{setup['sym']}_{int(time.time())}"
+    con.execute("""INSERT INTO trades
+        (id,sym,direction,entry,sl,target,trail_sl,qty,risk_amt,target_gain,rr,
+         score,days_held,opened_at,exit_reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
+        (tid, setup["sym"], "BUY", entry, sl, setup["target"],
+         sl,   # trail_sl starts at sl
+         qty, actual_risk, target_gain, setup["rr"],
+         setup["score"], datetime.now().isoformat(), ""))
+    con.commit()
+
+    log.info(f"  ◈ BUY {setup['sym']} qty:{qty} @ ₹{entry} "
+             f"SL:₹{sl} TGT:₹{setup['target']} R:R:{setup['rr']}x "
+             f"risk:₹{actual_risk} score:{setup['score']}")
+
+    # ── LIVE MODE: replace this block with your broker API call ──────────
+    # from kiteconnect import KiteConnect
+    # kite = KiteConnect(api_key=os.environ["KITE_API_KEY"])
+    # kite.set_access_token(os.environ["KITE_ACCESS_TOKEN"])
+    # kite.place_order(
+    #     tradingsymbol=setup["sym"], exchange="NSE",
+    #     transaction_type="BUY", quantity=qty,
+    #     order_type="LIMIT", price=entry, product="CNC"
+    # )
+    return True
+
+# ── STATS HELPERS ─────────────────────────────────────────────────────────────
+def _week_start():
     today = date.today()
     return (today - timedelta(days=today.weekday())).isoformat()
 
-def get_stats(con):
-    ws = week_start()
-    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)",(ws,))
+def _get_stats(con):
+    ws = _week_start()
+    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
     con.commit()
-    r = con.execute("SELECT pnl,risk_used,wins,losses,total_tokens FROM weekly_stats WHERE week_start=?",(ws,)).fetchone()
-    return {"pnl":r[0],"risk_used":r[1],"wins":r[2],"losses":r[3],"tokens":r[4]}
+    r = con.execute(
+        "SELECT pnl,risk_used,wins,losses,time_exits FROM weekly_stats WHERE week_start=?", (ws,)
+    ).fetchone()
+    return {"pnl":r[0],"risk_used":r[1],"wins":r[2],"losses":r[3],"time_exits":r[4]}
 
-def upd_stats(con, **kw):
-    ws = week_start()
+def _upd_stats(con, **kw):
+    ws = _week_start()
     sets = ",".join(f"{k}={k}+?" for k in kw)
     con.execute(f"UPDATE weekly_stats SET {sets} WHERE week_start=?", (*kw.values(), ws))
     con.commit()
 
-def size_qty(entry, sl, budget):
-    rp = abs(entry - sl)
-    return max(1, int(min(budget, RISK_PER_TRADE) / rp)) if rp > 0 else 0
-
-def close_trade(con, t, reason, custom_pnl=None):
-    cols = ["id","sym","direction","entry","sl","target","qty","risk_amt","target_gain","rr"]
-    if isinstance(t, sqlite3.Row): t = dict(zip(cols+["status","pnl","score","opened_at","closed_at","claude_reason"], t))
-    pnl = custom_pnl if custom_pnl is not None else \
-          (t["target_gain"] if "TARGET" in reason else -t["risk_amt"])
-    status = "win" if pnl > 0 else "loss"
-    con.execute("UPDATE trades SET status=?,pnl=?,closed_at=? WHERE id=?",
-                (status, round(pnl,2), datetime.now().isoformat(), t["id"]))
-    con.commit()
-    upd_stats(con, pnl=round(pnl,2),
-              risk_used=abs(pnl) if pnl<0 else 0,
-              wins=1 if pnl>0 else 0,
-              losses=0 if pnl>0 else 1)
-    log.info(f"  CLOSED {t['sym']} [{reason}] P&L ₹{pnl:+.0f}")
-
 # ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 def run():
-    log.info("══════════════════════════════════════════")
-    log.info("  ClaudeBot v2 · Full NSE Scanner · PAPER")
-    log.info(f"  Capital ₹{CAPITAL:,} · Risk ₹{MAX_WEEKLY_RISK:,}/week")
-    log.info("══════════════════════════════════════════")
+    log.info("════════════════════════════════════════════")
+    log.info("  ClaudeBot v3 · Pure Algo · NSE Swing")
+    log.info("  Strategy: RSI cross + EMA trend + ATR size")
+    log.info(f"  Capital:₹{CAPITAL:,}  Risk/week:₹{MAX_WEEKLY_RISK:,}")
+    log.info("════════════════════════════════════════════")
 
-    con = init_db()
-    ai  = Claude()
+    con   = init_db()
     cycle = 0
 
     while True:
         cycle += 1
         log.info(f"\n══ Cycle #{cycle} — {datetime.now().strftime('%H:%M:%S')} ══")
-        stats = get_stats(con)
+        stats = get_stats_safe(con)
 
-        # ── MANAGE OPEN POSITIONS ─────────────────────────────────────────
-        open_trades = con.execute("SELECT * FROM trades WHERE status='open'").fetchall()
-        for t in open_trades:
-            t = dict(zip(["id","sym","direction","entry","sl","target","qty",
-                           "risk_amt","target_gain","rr","status","pnl","score",
-                           "opened_at","closed_at","claude_reason"], t))
-            # Fetch live price
-            try:
-                tk = yf.Ticker(t["sym"]+".NS")
-                hist = tk.history(period="1d", interval="5m", timeout=8)
-                price = float(hist["Close"].iloc[-1]) if len(hist) > 0 else t["entry"]
-            except Exception:
-                price = t["entry"]
+        # 1. Manage existing positions (exits, trailing stops)
+        log.info("── Position check")
+        manage_positions(con)
 
-            # Hard SL / target
-            if t["direction"] == "BUY":
-                if price <= t["sl"]:   close_trade(con, t, "SL_HIT"); continue
-                if price >= t["target"]: close_trade(con, t, "TARGET_HIT"); continue
-            else:
-                if price >= t["sl"]:   close_trade(con, t, "SL_HIT"); continue
-                if price <= t["target"]: close_trade(con, t, "TARGET_HIT"); continue
-
-            # Claude exit check every 3 cycles
-            if cycle % 3 == 0:
-                try:
-                    ex = ai.check_exit(t, price)
-                    upd_stats(con, total_tokens=ex["tokens"])
-                    if ex["action"] == "EXIT":
-                        close_trade(con, t, "CLAUDE_EXIT", round(ex["pnl"],2))
-                    else:
-                        log.info(f"  HOLD {t['sym']} @ ₹{price:.0f} P&L:₹{ex['pnl']:.0f} — {ex['reason']}")
-                except Exception as e:
-                    log.warning(f"  Exit check {t['sym']}: {e}")
-
-        # ── SCAN MARKET ───────────────────────────────────────────────────
-        stats = get_stats(con)
-        open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+        # 2. Scan for new entries (if capacity available)
+        stats = get_stats_safe(con)
+        open_c = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
 
         if stats["risk_used"] >= MAX_WEEKLY_RISK:
-            log.warning("  Weekly risk limit hit — no new entries this week")
-        elif open_count >= MAX_OPEN:
-            log.info(f"  {open_count}/{MAX_OPEN} positions open — holding")
+            log.warning("  Weekly risk exhausted — no new entries")
+        elif open_c >= MAX_OPEN:
+            log.info(f"  Max positions open ({open_c}/{MAX_OPEN}) — skipping scan")
         else:
-            universe = fetch_nse_universe()
-            candidates = run_screener(universe, con)
+            universe = fetch_universe()
+            setups = scan_market(universe, con)
+            risk_left = MAX_WEEKLY_RISK - stats["risk_used"]
 
-            risk_remaining = MAX_WEEKLY_RISK - stats["risk_used"]
-            for stock in candidates:
-                open_count = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
-                if open_count >= MAX_OPEN: break
-                if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'",(stock["sym"],)).fetchone(): continue
+            entered = 0
+            for setup in setups:
+                open_c = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+                if open_c >= MAX_OPEN: break
+                already = con.execute(
+                    "SELECT 1 FROM trades WHERE sym=? AND status='open'", (setup["sym"],)
+                ).fetchone()
+                if already: continue
+                if execute_order(setup, con, risk_left):
+                    risk_left -= min(RISK_PER_TRADE, abs(setup["entry"]-setup["sl"]))
+                    entered += 1
 
-                try:
-                    sig = ai.get_signal(stock, risk_remaining)
-                    con.execute(
-                        "INSERT INTO scan_log (ts,sym,signal,rr,skipped,model_used,tokens_used,algo_score) VALUES (?,?,?,?,?,?,?,?)",
-                        (datetime.now().isoformat(), stock["sym"],
-                         sig.get("signal","?"), sig.get("rr",0),
-                         1 if sig["signal"] in ("SKIP","HOLD") else 0,
-                         sig.get("model","?"), sig.get("tokens",0), stock["score"])
-                    )
-                    con.commit()
-                    upd_stats(con, total_tokens=sig.get("tokens",0))
+            if not entered:
+                log.info("  No qualifying setups this cycle")
 
-                    if sig.get("signal") in ("BUY","SELL") and sig.get("rr",0) >= MIN_RR:
-                        qty = size_qty(sig["entry"], sig["sl"], risk_remaining)
-                        if qty < 1: continue
-                        actual_risk = round(qty * abs(sig["entry"]-sig["sl"]), 2)
-                        tid = f"{stock['sym']}_{int(time.time())}"
-                        con.execute("""
-                            INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,'open',0,?,?,NULL,?)
-                        """, (tid, stock["sym"], sig["signal"],
-                              sig["entry"], sig["sl"], sig["target"],
-                              qty, actual_risk,
-                              round(qty*abs(sig["entry"]-sig["target"]),2),
-                              sig["rr"], stock["score"],
-                              datetime.now().isoformat(), sig.get("reason","")))
-                        con.commit()
-                        risk_remaining -= actual_risk
-                        log.info(
-                            f"  ◈ {sig['signal']} {stock['sym']} score:{stock['score']} "
-                            f"qty:{qty} @ ₹{sig['entry']} SL:₹{sig['sl']} TGT:₹{sig['target']} "
-                            f"R:R:{sig['rr']}x risk:₹{actual_risk} [{sig['tokens']}tok]"
-                        )
-                    else:
-                        log.info(f"  {stock['sym']} score:{stock['score']} → {sig.get('signal')} (R:R {sig.get('rr',0)}x)")
-
-                except Exception as e:
-                    log.error(f"  Signal error {stock['sym']}: {e}")
-                time.sleep(1)
-
-        # ── STATUS ────────────────────────────────────────────────────────
-        stats = get_stats(con)
-        oc = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
-        total = stats["wins"]+stats["losses"]
-        wr = round(stats["wins"]/total*100) if total else 0
+        # 3. Print weekly summary
+        stats = get_stats_safe(con)
+        open_c = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+        total  = stats["wins"] + stats["losses"]
+        wr     = round(stats["wins"]/total*100) if total else 0
         log.info(
-            f"\n  P&L:₹{stats['pnl']:+.0f}  Risk:₹{stats['risk_used']:.0f}/₹{MAX_WEEKLY_RISK}"
-            f"  W/L:{stats['wins']}/{stats['losses']}({wr}%)  Open:{oc}  Tokens:{stats['tokens']:,}"
+            f"\n  P&L:₹{stats['pnl']:+.0f}  "
+            f"Risk:₹{stats['risk_used']:.0f}/₹{MAX_WEEKLY_RISK}  "
+            f"W:{stats['wins']} L:{stats['losses']} ({wr}% WR)  "
+            f"Open:{open_c}  TimeExits:{stats['time_exits']}"
         )
-        log.info(f"  Next scan in {SCAN_INTERVAL}s…\n")
+        log.info(f"  Sleeping {SCAN_INTERVAL}s…\n")
         time.sleep(SCAN_INTERVAL)
+
+def get_stats_safe(con):
+    ws = _week_start()
+    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
+    con.commit()
+    r = con.execute(
+        "SELECT pnl,risk_used,wins,losses,time_exits FROM weekly_stats WHERE week_start=?", (ws,)
+    ).fetchone()
+    return {"pnl":r[0],"risk_used":r[1],"wins":r[2],"losses":r[3],"time_exits":r[4]}
 
 if __name__ == "__main__":
     run()
