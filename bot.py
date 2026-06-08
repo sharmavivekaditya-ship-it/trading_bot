@@ -14,6 +14,11 @@ import time, json, sqlite3, os, logging, io, math
 from datetime import datetime, date, timedelta
 import urllib.request
 
+# DB path — uses /data/trades.db if Railway volume is mounted, else local
+import os as _os
+DB_PATH = _os.environ.get("DB_PATH",
+    "/data/trades.db" if _os.path.isdir("/data") else "trades.db")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
@@ -100,7 +105,7 @@ FALLBACK = [
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 def init_db():
-    con = sqlite3.connect("trades.db")
+    con = sqlite3.connect(DB_PATH)
     con.executescript("""
     CREATE TABLE IF NOT EXISTS trades (
         id TEXT PRIMARY KEY, sym TEXT, direction TEXT,
@@ -399,35 +404,31 @@ def time_to_open() -> str:
 
 def scan_and_trade(universe, con, risk_left):
     """
-    Scan universe AND place orders immediately when a setup is found.
-    Trades fire during the scan so Railway restarts don't block execution.
+    Two-pass scan:
+      Pass 1 — scan all 500 stocks, collect every valid setup (no orders)
+      Pass 2 — rank by composite score, take top 5, place orders
+
+    This ensures we always trade the BEST setups, not just the first ones found.
     """
     cache_cutoff  = (datetime.now()-timedelta(hours=4)).isoformat()
     reject_counts = {}
     total         = len(universe)
-    setups_found  = 0
-    orders_placed = 0
+    all_setups    = []
 
+    # ── PASS 1: SCAN ALL — collect setups, place NO orders ───────────────────
+    log.info(f"  Pass 1: scanning {total} stocks for setups…")
     for i in range(0, total, BATCH_SIZE):
         batch = universe[i:i+BATCH_SIZE]
         for sym in batch:
             if con.execute(
-                "SELECT 1 FROM trades WHERE sym=? AND status=\'open\'", (sym,)
+                "SELECT 1 FROM trades WHERE sym=? AND status='open'", (sym,)
             ).fetchone():
                 continue
             setup, reason = screen(sym, cache_cutoff, con)
             if setup:
-                setups_found += 1
-                log.info(f"  ✓ SETUP {sym} "
-                         f"wRSI:{setup['rsi_prev']} dRSI:{setup['rsi']} "
-                         f"mcap:₹{setup.get('mcap_cr',0):.0f}Cr "
-                         f"score:{setup['score']}")
-                if risk_left > 0:
-                    rp = abs(setup['entry'] - setup['sl'])
-                    qty = max(1, int(min(risk_left, RISK_PER_TRADE) / rp)) if rp > 0 else 0
-                    if qty > 0 and execute_order(setup, con, risk_left):
-                        risk_left -= min(RISK_PER_TRADE, qty * rp)
-                        orders_placed += 1
+                all_setups.append(setup)
+                log.info(f"  ✓ {sym} wRSI:{setup['rsi_prev']} dRSI:{setup['rsi']} "
+                         f"mcap:₹{setup.get('mcap_cr',0):.0f}Cr score:{setup['score']}")
             else:
                 real = reason.replace("cached:","") if reason else "unknown"
                 key  = real.split("(")[0]
@@ -435,24 +436,56 @@ def scan_and_trade(universe, con, risk_left):
 
         done = min(i+BATCH_SIZE, total)
         top_rejects = " | ".join(
-            f"{k}:{v}" for k,v in sorted(reject_counts.items(), key=lambda x:-x[1])[:4]
+            f"{k}:{v}" for k,v in
+            sorted(reject_counts.items(), key=lambda x:-x[1])[:4]
         )
-        log.info(f"  Scanned {done}/{total} — {setups_found} setups, {orders_placed} orders | {top_rejects}")
+        log.info(f"  Scanned {done}/{total} — {len(all_setups)} setups found | {top_rejects}")
         if i+BATCH_SIZE < total:
             time.sleep(BATCH_PAUSE)
 
-    log.info("  ── Final rejection breakdown ──")
+    # ── PASS 1 SUMMARY ────────────────────────────────────────────────────────
+    log.info(f"\n  Pass 1 complete: {len(all_setups)} total setups across {total} stocks")
+    log.info("  ── Rejection breakdown ──")
     for k,v in sorted(reject_counts.items(), key=lambda x:-x[1]):
-        log.info(f"     {k:<30} {v:>5} stocks")
+        log.info(f"     {k:<35} {v:>5} stocks")
 
-    if setups_found == 0:
-        rsi_fail = reject_counts.get("daily_rsi_low", 0) + reject_counts.get("rsi_not_setup", 0)
-        total_s  = sum(reject_counts.values())
-        if rsi_fail > total_s * 0.4:
-            log.info("  Market verdict: LOW MOMENTUM — most RSIs below threshold")
-        else:
-            log.info("  Market verdict: NEUTRAL — conditions not aligned, waiting")
-        log.info(f"  Bot healthy. Next scan in {SCAN_INTERVAL}s.")
+    if not all_setups:
+        log.info("  No setups found — market not in momentum. Next scan in 300s.")
+        return 0
+
+    # ── PASS 2: RANK AND SELECT TOP 5 ─────────────────────────────────────────
+    all_setups.sort(key=lambda x: x["score"], reverse=True)
+    top5 = all_setups[:5]
+
+    log.info(f"\n  Pass 2: top 5 setups by score (from {len(all_setups)} found):")
+    log.info(f"  {'RANK':<5} {'SYM':<15} {'SCORE':>6} {'wRSI':>6} {'dRSI':>6} "
+             f"{'MCAP(Cr)':>10} {'ENTRY':>8} {'SL':>8} {'TGT':>8}")
+    log.info("  " + "─"*75)
+    for rank, s in enumerate(top5, 1):
+        log.info(f"  #{rank:<4} {s['sym']:<15} {s['score']:>6} "
+                 f"{s['rsi_prev']:>6} {s['rsi']:>6} "
+                 f"{s.get('mcap_cr',0):>10.0f} "
+                 f"₹{s['entry']:>7.2f} ₹{s['sl']:>7.2f} ₹{s['target']:>7.2f}")
+
+    # ── PLACE ORDERS FOR TOP 5 ─────────────────────────────────────────────────
+    log.info("\n  Placing orders for top 5:")
+    orders_placed = 0
+    for s in top5:
+        if con.execute(
+            "SELECT 1 FROM trades WHERE sym=? AND status='open'", (s["sym"],)
+        ).fetchone():
+            log.info(f"  SKIP {s['sym']} — already open")
+            continue
+        if risk_left <= 0:
+            log.info("  Risk budget exhausted — stopping")
+            break
+        if execute_order(s, con, risk_left):
+            rp = abs(s["entry"] - s["sl"])
+            qty = max(1, int(min(risk_left, RISK_PER_TRADE) / rp)) if rp > 0 else 1
+            risk_left -= min(RISK_PER_TRADE, qty * rp)
+            orders_placed += 1
+
+    log.info(f"\n  ✓ {orders_placed} orders placed from top {len(top5)} setups")
     return orders_placed
 
 
@@ -707,7 +740,7 @@ def start_dashboard():
     import threading
 
     app = Flask(__name__)
-    DB  = "trades.db"
+    DB  = DB_PATH
 
     DASH_HTML = """<!DOCTYPE html>
 <html><head>
