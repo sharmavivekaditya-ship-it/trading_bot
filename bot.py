@@ -145,6 +145,9 @@ def fetch_universe():
             # NSE Nifty 500 CSV has column "Symbol"
             col = [c for c in df.columns if "symbol" in c.lower()][0]
             syms = df[col].dropna().str.strip().tolist()
+            # Filter out dummy/test/placeholder symbols
+            syms = [s for s in syms if s and not s.upper().startswith("DUMMY")
+                    and not s.upper().startswith("TEST") and len(s) <= 20]
             log.info(f"Nifty 500 universe: {len(syms)} symbols loaded")
             return syms
         except Exception as e:
@@ -304,7 +307,7 @@ def screen(sym, cache_cutoff, con):
 def is_market_open() -> bool:
     """NSE is open Mon–Fri 09:15–15:30 IST (UTC+5:30)."""
     ist_offset = timedelta(hours=5, minutes=30)
-    now_ist = datetime.utcnow() + ist_offset
+    now_ist = datetime.now(tz=__import__('datetime').timezone.utc).replace(tzinfo=None) + ist_offset
     if now_ist.weekday() >= 5:          # Saturday=5, Sunday=6
         return False
     market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
@@ -314,7 +317,7 @@ def is_market_open() -> bool:
 def time_to_open() -> str:
     """Human-readable time until next NSE open."""
     ist_offset = timedelta(hours=5, minutes=30)
-    now_ist = datetime.utcnow() + ist_offset
+    now_ist = datetime.now(tz=__import__('datetime').timezone.utc).replace(tzinfo=None) + ist_offset
     # Find next weekday 09:15
     candidate = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
     if now_ist >= candidate:
@@ -370,7 +373,17 @@ def scan_market(universe, con):
             log.info(f"    {s['sym']} score:{s['score']} "
                      f"entry:₹{s['entry']} sl:₹{s['sl']} tgt:₹{s['target']}")
     else:
-        log.info("  No setups passed all filters this cycle")
+        # Give a plain-English market context summary
+        rsi_fail  = reject_counts.get("rsi_not_setup", 0)
+        trend_fail = reject_counts.get("no_uptrend", 0)
+        total_scanned = sum(reject_counts.values()) + len(setups)
+        if rsi_fail > total_scanned * 0.4:
+            log.info("  Market verdict: OVERBOUGHT — most RSIs above 42, no dip setups available")
+        elif trend_fail > total_scanned * 0.3:
+            log.info("  Market verdict: MIXED — RSIs ok but many stocks in downtrend/sideways")
+        else:
+            log.info("  Market verdict: NEUTRAL — conditions not aligned, waiting")
+        log.info(f"  Bot is healthy. Will scan again in {SCAN_INTERVAL}s.")
     return top
 
 # ── MANAGE OPEN POSITIONS ─────────────────────────────────────────────────────
@@ -592,7 +605,7 @@ def start_dashboard():
 <html><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ClaudeBot · NSE</title>
+<title>First-Orbit Trader PRO</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap');
 *{box-sizing:border-box;margin:0;padding:0}
@@ -685,9 +698,9 @@ body{background:#080b0f;color:#a8b4c0;font-family:'IBM Plex Mono',monospace;font
 
 <!-- TOP BAR -->
 <div class="bar">
-  <div class="logo">◈ CLAUDEBOT · NSE SWING</div>
+  <div class="logo">⬡ FIRST-ORBIT TRADER PRO</div>
   <div class="bar-r">
-    <span><span class="ping"></span>PAPER MODE</span>
+    <span><span class="ping"></span>◉ PAPER MODE</span>
     <span class="ist" id="ist-clock">--:--:-- IST</span>
     <span id="conn" style="color:#1a4030;font-size:14px">●</span>
   </div>
@@ -718,6 +731,38 @@ body{background:#080b0f;color:#a8b4c0;font-family:'IBM Plex Mono',monospace;font
   <div class="met"><div class="ml">Win Rate</div><div class="mv" id="mwr">—</div><div class="ms" id="mwrs">—</div></div>
   <div class="met"><div class="ml">Risk Used</div><div class="mv a" id="mr">—</div><div class="ms" id="mrs">—</div></div>
   <div class="met"><div class="ml">Open Trades</div><div class="mv a" id="mo">—</div><div class="ms">max 3 concurrent</div></div>
+</div>
+
+
+<!-- STRATEGY PANEL -->
+<div style="background:#0d1520;border-bottom:1px solid #162030;padding:10px 18px;display:flex;flex-wrap:wrap;gap:24px;align-items:center">
+  <div style="font-size:9px;color:#2a5060;letter-spacing:2px;text-transform:uppercase;white-space:nowrap">Active Strategy</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px">
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Signal</span>
+      <span style="background:#031a0d;color:#00e676;border:1px solid #0d3a1a;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:1px">RSI MEAN REVERSION</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Entry</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">RSI 28–42 · EMA20 &gt; EMA50 · Vol ≥ 1.2×</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Stop</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Entry − 1.5 × ATR</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Target</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Entry + 3.0 × ATR &nbsp;·&nbsp; R:R 2.0×</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Exit</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">SL · Target · RSI &gt; 70 · 5-day time stop</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Universe</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Nifty 500 · NSE equities</span>
+    </div>
+  </div>
 </div>
 
 <!-- TRADES -->
