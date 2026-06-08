@@ -397,34 +397,47 @@ def time_to_open() -> str:
     return f"{h}h {m}m"
 
 
-def scan_market(universe, con):
-    cache_cutoff = (datetime.now()-timedelta(hours=4)).isoformat()
-    setups = []
+def scan_and_trade(universe, con, risk_left):
+    """
+    Scan universe AND place orders immediately when a setup is found.
+    Trades fire during the scan so Railway restarts don't block execution.
+    """
+    cache_cutoff  = (datetime.now()-timedelta(hours=4)).isoformat()
     reject_counts = {}
-    total = len(universe)
+    total         = len(universe)
+    setups_found  = 0
+    orders_placed = 0
 
     for i in range(0, total, BATCH_SIZE):
         batch = universe[i:i+BATCH_SIZE]
         for sym in batch:
+            if con.execute(
+                "SELECT 1 FROM trades WHERE sym=? AND status=\'open\'", (sym,)
+            ).fetchone():
+                continue
             setup, reason = screen(sym, cache_cutoff, con)
             if setup:
-                setups.append(setup)
-                log.info(f"  ✓ SETUP {sym} RSI:{setup['rsi_prev']}→{setup['rsi']} "
-                         f"vol:{setup['vol_ratio']}x atr:{setup['atr_pct']}% "
+                setups_found += 1
+                log.info(f"  ✓ SETUP {sym} "
+                         f"wRSI:{setup['rsi_prev']} dRSI:{setup['rsi']} "
+                         f"mcap:₹{setup.get('mcap_cr',0):.0f}Cr "
                          f"score:{setup['score']}")
+                if risk_left > 0:
+                    rp = abs(setup['entry'] - setup['sl'])
+                    qty = max(1, int(min(risk_left, RISK_PER_TRADE) / rp)) if rp > 0 else 0
+                    if qty > 0 and execute_order(setup, con, risk_left):
+                        risk_left -= min(RISK_PER_TRADE, qty * rp)
+                        orders_placed += 1
             else:
-                # strip cache: prefix to get real reason
                 real = reason.replace("cached:","") if reason else "unknown"
                 key  = real.split("(")[0]
                 reject_counts[key] = reject_counts.get(key, 0) + 1
 
         done = min(i+BATCH_SIZE, total)
-        # Print rejection breakdown every 30 symbols so you see it mid-scan
         top_rejects = " | ".join(
-            f"{k}:{v}" for k,v in
-            sorted(reject_counts.items(), key=lambda x:-x[1])[:4]
+            f"{k}:{v}" for k,v in sorted(reject_counts.items(), key=lambda x:-x[1])[:4]
         )
-        log.info(f"  Scanned {done}/{total} — {len(setups)} setups | {top_rejects}")
+        log.info(f"  Scanned {done}/{total} — {setups_found} setups, {orders_placed} orders | {top_rejects}")
         if i+BATCH_SIZE < total:
             time.sleep(BATCH_PAUSE)
 
@@ -432,26 +445,16 @@ def scan_market(universe, con):
     for k,v in sorted(reject_counts.items(), key=lambda x:-x[1]):
         log.info(f"     {k:<30} {v:>5} stocks")
 
-    setups.sort(key=lambda x: x["score"], reverse=True)
-    top = setups[:TOP_N]
-    if top:
-        log.info(f"  Top {len(top)} setups selected:")
-        for s in top:
-            log.info(f"    {s['sym']} score:{s['score']} "
-                     f"entry:₹{s['entry']} sl:₹{s['sl']} tgt:₹{s['target']}")
-    else:
-        # Give a plain-English market context summary
-        rsi_fail  = reject_counts.get("rsi_not_setup", 0)
-        trend_fail = reject_counts.get("no_uptrend", 0)
-        total_scanned = sum(reject_counts.values()) + len(setups)
-        if rsi_fail > total_scanned * 0.4:
-            log.info("  Market verdict: OVERBOUGHT — most RSIs above 42, no dip setups available")
-        elif trend_fail > total_scanned * 0.3:
-            log.info("  Market verdict: MIXED — RSIs ok but many stocks in downtrend/sideways")
+    if setups_found == 0:
+        rsi_fail = reject_counts.get("daily_rsi_low", 0) + reject_counts.get("rsi_not_setup", 0)
+        total_s  = sum(reject_counts.values())
+        if rsi_fail > total_s * 0.4:
+            log.info("  Market verdict: LOW MOMENTUM — most RSIs below threshold")
         else:
             log.info("  Market verdict: NEUTRAL — conditions not aligned, waiting")
-        log.info(f"  Bot is healthy. Will scan again in {SCAN_INTERVAL}s.")
-    return top
+        log.info(f"  Bot healthy. Next scan in {SCAN_INTERVAL}s.")
+    return orders_placed
+
 
 # ── MANAGE OPEN POSITIONS ─────────────────────────────────────────────────────
 def check_rsi_divergence(sym: str, lookback: int = 5) -> tuple[bool, str]:
