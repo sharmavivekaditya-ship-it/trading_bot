@@ -38,33 +38,46 @@ import numpy as np
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 CAPITAL         = 100_000
 MAX_WEEKLY_RISK = 3_000
-RISK_PER_TRADE  = 800
-MAX_OPEN        = 3
-SCAN_INTERVAL   = 300       # seconds between cycles
-TOP_N           = 3         # max new trades per cycle
-BATCH_SIZE      = 50        # symbols per batch
-BATCH_PAUSE     = 1         # seconds between batches
-USE_NIFTY500    = True      # scan Nifty 500 only (covers 95% of volume, fits Railway)
+RISK_PER_TRADE  = 800         # ₹ risked per trade
+MAX_OPEN        = 999         # no limit — full capital deployment
+SCAN_INTERVAL   = 300         # seconds between scan cycles (5 min)
+TOP_N           = 999         # enter all valid setups found
+BATCH_SIZE      = 50          # symbols per batch (Railway memory-safe)
+BATCH_PAUSE     = 1           # seconds between batches
+USE_NIFTY500    = True        # Nifty 500 = 95% of market volume, fits Railway
 
-# Liquidity gates
-MIN_PRICE       = 50         # lowered: include mid-caps from ₹50
-MAX_PRICE       = 8_000
-MIN_AVG_VOL     = 150_000    # lowered: include liquid mid-caps
+# ── STRATEGY: Dual RSI Momentum + Market Cap Filter ──────────────────────────
+# Entry:  Weekly RSI(14) > 60  AND  Daily RSI(14) > 60
+#         Both timeframes in momentum = strong trend confirmation
+#         Market cap > ₹20,000 Cr = large/mid cap quality filter
+#
+# Exit:   Bearish RSI divergence  — price up, RSI lower highs → trend weakening
+#         Daily RSI < 50          — momentum gone, exit immediately
+#         Weekly RSI < 55         — macro trend broken
+#         Hard stop: entry − 2×ATR — capital protection floor
+#
+# Sizing: qty = ₹800 ÷ (entry − hard_stop)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Strategy params
-RSI_PERIOD      = 14
-RSI_ENTRY_LOW   = 28         # RSI zone bottom — oversold
-RSI_ENTRY_HIGH  = 42         # RSI zone top — still cheap
-RSI_EXIT_OB     = 70         # exit if RSI hits overbought
-EMA_FAST        = 20
-EMA_SLOW        = 50
-VOL_MULT        = 1.2        # volume must be this × 20d avg (relaxed)
-ATR_PERIOD      = 14
-ATR_MIN_PCT     = 1.0        # min daily ATR% (relaxed)
-ATR_MAX_PCT     = 6.0        # max daily ATR% (relaxed slightly)
-ATR_STOP_MULT   = 1.5
-ATR_TARGET_MULT = 3.0        # guarantees R:R = 2.0
-TIME_STOP_DAYS  = 5
+# Liquidity + quality gates
+MIN_PRICE        = 50
+MAX_PRICE        = 50_000
+MIN_AVG_VOL      = 200_000    # shares/day
+MIN_MCAP_CR      = 20_000     # ₹ Crores — large/mid cap only
+
+# RSI parameters
+RSI_PERIOD       = 14
+WEEKLY_RSI_ENTRY = 60         # weekly RSI must be ABOVE this
+DAILY_RSI_ENTRY  = 60         # daily RSI must be ABOVE this
+DAILY_RSI_EXIT   = 50         # exit when daily RSI drops below this
+WEEKLY_RSI_EXIT  = 55         # exit when weekly RSI drops below this
+
+# ATR for hard stop sizing
+ATR_PERIOD       = 14
+ATR_STOP_MULT    = 2.0        # hard stop = entry − 2×ATR
+
+# Divergence detection
+DIVERGENCE_LOOKBACK = 5       # bars to look back for RSI divergence
 
 NSE_CSV = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
@@ -190,13 +203,45 @@ def calc_atr(high, low, close, period=14):
     return float(np.mean(tr[-period:]))
 
 # ── SCREEN ONE SYMBOL ─────────────────────────────────────────────────────────
+def get_mcap_cr(sym: str) -> float:
+    """
+    Fetch market cap in ₹ Crores via yfinance fast_info.
+    Returns 0 if unavailable.
+    """
+    try:
+        info = yf.Ticker(sym + ".NS").fast_info
+        mcap = getattr(info, "market_cap", None) or 0
+        return mcap / 1e7   # convert ₹ to ₹ Crores
+    except Exception:
+        return 0
+
+
+def calc_weekly_rsi(sym: str, period: int = 14) -> tuple[float, list]:
+    """
+    Download weekly OHLCV (2 years) and compute RSI.
+    Returns (latest_rsi, rsi_list) — rsi_list used for divergence detection.
+    """
+    df = yf.Ticker(sym + ".NS").history(
+        period="2y", interval="1wk", timeout=12, auto_adjust=True
+    )
+    if df is None or len(df) < period + 5:
+        return 0.0, []
+    rsi_list = calc_rsi(df["Close"].values.astype(float), period)
+    return (float(rsi_list[-1]) if rsi_list else 0.0), rsi_list
+
+
 def screen(sym, cache_cutoff, con):
     """
-    Returns (setup_dict, reject_reason).
-    setup_dict is None if no valid entry.
-    Logs exactly why each stock was rejected.
+    Dual RSI Momentum strategy screener.
+
+    ENTRY CONDITIONS (all must be true):
+      1. Market cap > ₹20,000 Cr
+      2. Weekly RSI(14) > 60
+      3. Daily RSI(14) > 60
+
+    Returns (setup_dict, None) on valid entry, (None, reject_reason) otherwise.
     """
-    # Check 4-hour cache first
+    # ── Cache check ──────────────────────────────────────────────────────────
     cached = con.execute(
         "SELECT score,rsi,rsi_prev,vol_ratio,atr_pct,price,ema20,ema50,"
         "entry,sl,target,rr,reject_reason "
@@ -205,95 +250,117 @@ def screen(sym, cache_cutoff, con):
     ).fetchone()
     if cached:
         score,rsi_n,rsi_p,vol_r,atr_p,price,e20,e50,entry,sl,tgt,rr,rej = cached
-        if entry:   # was a valid setup
+        if entry:
             return {"sym":sym,"score":score,"rsi":rsi_n,"rsi_prev":rsi_p,
                     "vol_ratio":vol_r,"atr_pct":atr_p,"price":price,
                     "ema20":e20,"ema50":e50,"entry":entry,"sl":sl,
                     "target":tgt,"rr":rr}, None
         return None, f"cached:{rej}"
 
-    now = datetime.now().isoformat()
+    now    = datetime.now().isoformat()
     reject = None
 
     try:
-        df = yf.Ticker(sym+".NS").history(period="90d", interval="1d",
-                                           timeout=10, auto_adjust=True)
-        if df is None or len(df) < EMA_SLOW + 5:
+        # ── Daily data (90 days) ──────────────────────────────────────────────
+        df = yf.Ticker(sym+".NS").history(
+            period="90d", interval="1d", timeout=12, auto_adjust=True
+        )
+        if df is None or len(df) < RSI_PERIOD + 5:
             reject = "insufficient_data"
         else:
-            c = df["Close"].values.astype(float)
-            h = df["High"].values.astype(float)
-            l = df["Low"].values.astype(float)
-            v = df["Volume"].values.astype(float)
+            c         = df["Close"].values.astype(float)
+            h         = df["High"].values.astype(float)
+            l         = df["Low"].values.astype(float)
+            v         = df["Volume"].values.astype(float)
             price     = float(c[-1])
             avg_vol   = float(np.mean(v[-20:]))
-            today_vol = float(v[-1])
 
             # Gate 1: price range
-            if   price < MIN_PRICE:  reject = f"price_low(₹{price:.0f})"
-            elif price > MAX_PRICE:  reject = f"price_high(₹{price:.0f})"
+            if price < MIN_PRICE:
+                reject = f"price_low(₹{price:.0f})"
+            elif price > MAX_PRICE:
+                reject = f"price_high(₹{price:.0f})"
             # Gate 2: liquidity
-            elif avg_vol < MIN_AVG_VOL: reject = f"low_vol({avg_vol:.0f})"
+            elif avg_vol < MIN_AVG_VOL:
+                reject = f"low_vol({int(avg_vol):,})"
             else:
-                rsi_list  = calc_rsi(c, RSI_PERIOD)
-                if len(rsi_list) < 2:
-                    reject = "rsi_calc_error"
+                # Gate 3: market cap > ₹20,000 Cr
+                mcap = get_mcap_cr(sym)
+                if mcap < MIN_MCAP_CR:
+                    reject = f"small_cap(₹{mcap:.0f}Cr<₹{MIN_MCAP_CR}Cr)"
                 else:
-                    rsi_now  = rsi_list[-1]
-                    rsi_prev = rsi_list[-2]
-                    ema20    = calc_ema(c, EMA_FAST)
-                    ema50    = calc_ema(c, EMA_SLOW)
-                    atr_val  = calc_atr(h, l, c, ATR_PERIOD)
-                    atr_pct  = atr_val / price * 100
-                    vol_ratio = today_vol / avg_vol
-
-                    # Gate 3: RSI in oversold-recovery zone
-                    # Condition: RSI currently between 28-42 AND was below 45 yesterday
-                    # This catches: fresh crosses, ongoing recoveries, and dip bounces
-                    rsi_in_zone = RSI_ENTRY_LOW <= rsi_now <= RSI_ENTRY_HIGH
-                    rsi_was_low = rsi_prev < 45
-                    if not (rsi_in_zone and rsi_was_low):
-                        reject = f"rsi_not_setup(prev:{rsi_prev:.1f} now:{rsi_now:.1f} zone:{RSI_ENTRY_LOW}-{RSI_ENTRY_HIGH})"
-                    # Gate 4: uptrend (price > EMA50, EMA20 > EMA50)
-                    elif not (price > ema50 and ema20 > ema50):
-                        reject = f"no_uptrend(p:{price:.0f} e20:{ema20:.0f} e50:{ema50:.0f})"
-                    # Gate 5: volume above threshold
-                    elif vol_ratio < VOL_MULT:
-                        reject = f"low_vol_ratio({vol_ratio:.2f}x<{VOL_MULT}x)"
-                    # Gate 6: ATR in swingable range
-                    elif not (ATR_MIN_PCT <= atr_pct <= ATR_MAX_PCT):
-                        reject = f"atr_oor({atr_pct:.1f}% need {ATR_MIN_PCT}-{ATR_MAX_PCT}%)"
+                    # Gate 4: daily RSI > 60
+                    daily_rsi_list = calc_rsi(c, RSI_PERIOD)
+                    if not daily_rsi_list:
+                        reject = "rsi_calc_error"
                     else:
-                        # ALL CONDITIONS MET — compute setup
-                        entry  = round(price, 2)
-                        sl     = round(entry - ATR_STOP_MULT * atr_val, 2)
-                        target = round(entry + ATR_TARGET_MULT * atr_val, 2)
-                        rr     = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)
+                        daily_rsi = float(daily_rsi_list[-1])
+                        if daily_rsi <= DAILY_RSI_ENTRY:
+                            reject = f"daily_rsi_low({daily_rsi:.1f}<={DAILY_RSI_ENTRY})"
+                        else:
+                            # Gate 5: weekly RSI > 60
+                            weekly_rsi, weekly_rsi_list = calc_weekly_rsi(sym)
+                            if weekly_rsi <= WEEKLY_RSI_ENTRY:
+                                reject = f"weekly_rsi_low({weekly_rsi:.1f}<={WEEKLY_RSI_ENTRY})"
+                            else:
+                                # ── ALL CONDITIONS MET ────────────────────────
+                                entry = round(price, 2)
 
-                        rsi_score   = max(0, 100-(rsi_now-RSI_ENTRY_LOW)*5)  # best score at low end of zone
-                        vol_score   = min(100, (vol_ratio-VOL_MULT)/2*100)
-                        atr_score   = max(0, 100-abs(atr_pct-2.5)*15)
-                        ema_gap     = (ema20-ema50)/ema50*100
-                        trend_score = min(100, ema_gap*20)
-                        score       = round(rsi_score*0.35+vol_score*0.30+
-                                            trend_score*0.20+atr_score*0.15, 1)
+                                # Hard stop = entry − 2×ATR
+                                atr_val = calc_atr(h, l, c, ATR_PERIOD)
+                                sl      = round(entry - ATR_STOP_MULT * atr_val, 2)
+                                atr_pct = atr_val / price * 100
 
-                        con.execute("""INSERT OR REPLACE INTO screener_cache
-                            (sym,score,rsi,rsi_prev,vol_ratio,atr_pct,price,
-                             ema20,ema50,entry,sl,target,rr,reject_reason,updated_at)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)""",
-                            (sym,score,round(rsi_now,1),round(rsi_prev,1),
-                             round(vol_ratio,2),round(atr_pct,2),round(price,2),
-                             round(ema20,2),round(ema50,2),entry,sl,target,rr,now))
-                        con.commit()
-                        return {"sym":sym,"score":score,"rsi":round(rsi_now,1),
-                                "rsi_prev":round(rsi_prev,1),"vol_ratio":round(vol_ratio,2),
-                                "atr_pct":round(atr_pct,2),"price":price,
-                                "ema20":round(ema20,2),"ema50":round(ema50,2),
-                                "entry":entry,"sl":sl,"target":target,"rr":rr}, None
+                                # Target: next resistance proxy = entry + 3×ATR
+                                # (open-ended momentum trade, but need a level for sizing)
+                                target  = round(entry + 3.0 * atr_val, 2)
+                                rr      = round(3.0 / ATR_STOP_MULT, 2)
+
+                                # EMA for context
+                                ema20 = calc_ema(c, 20)
+                                ema50 = calc_ema(c, 50)
+                                vol_r = float(v[-1]) / avg_vol
+
+                                # Score: higher weekly + daily RSI = stronger momentum
+                                score = round(
+                                    (weekly_rsi - 60) * 0.5 +
+                                    (daily_rsi  - 60) * 0.5 +
+                                    min(20, (mcap / 100_000) * 5),   # mcap bonus
+                                    1
+                                )
+
+                                con.execute("""INSERT OR REPLACE INTO screener_cache
+                                    (sym,score,rsi,rsi_prev,vol_ratio,atr_pct,price,
+                                     ema20,ema50,entry,sl,target,rr,reject_reason,updated_at)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,?)""",
+                                    (sym, score, round(daily_rsi,1),
+                                     round(weekly_rsi,1), round(vol_r,2),
+                                     round(atr_pct,2), price,
+                                     round(ema20,2), round(ema50,2),
+                                     entry, sl, target, rr, now))
+                                con.commit()
+
+                                return {
+                                    "sym":       sym,
+                                    "score":     score,
+                                    "rsi":       round(daily_rsi, 1),    # daily
+                                    "rsi_prev":  round(weekly_rsi, 1),   # weekly (stored in rsi_prev)
+                                    "vol_ratio": round(vol_r, 2),
+                                    "atr_pct":   round(atr_pct, 2),
+                                    "price":     price,
+                                    "ema20":     round(ema20, 2),
+                                    "ema50":     round(ema50, 2),
+                                    "entry":     entry,
+                                    "sl":        sl,
+                                    "target":    target,
+                                    "rr":        rr,
+                                    "daily_rsi": round(daily_rsi, 1),
+                                    "weekly_rsi":round(weekly_rsi, 1),
+                                    "mcap_cr":   round(mcap, 0),
+                                }, None
 
     except Exception as e:
-        reject = f"error:{str(e)[:40]}"
+        reject = f"error:{str(e)[:50]}"
 
     # Cache the rejection
     con.execute("""INSERT OR REPLACE INTO screener_cache
@@ -303,33 +370,8 @@ def screen(sym, cache_cutoff, con):
         (sym, reject, now))
     return None, reject
 
-# ── MARKET HOURS CHECK ───────────────────────────────────────────────────────
-def is_market_open() -> bool:
-    """NSE is open Mon–Fri 09:15–15:30 IST (UTC+5:30)."""
-    ist_offset = timedelta(hours=5, minutes=30)
-    now_ist = datetime.now(tz=__import__('datetime').timezone.utc).replace(tzinfo=None) + ist_offset
-    if now_ist.weekday() >= 5:          # Saturday=5, Sunday=6
-        return False
-    market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
-    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
-    return market_open <= now_ist <= market_close
 
-def time_to_open() -> str:
-    """Human-readable time until next NSE open."""
-    ist_offset = timedelta(hours=5, minutes=30)
-    now_ist = datetime.now(tz=__import__('datetime').timezone.utc).replace(tzinfo=None) + ist_offset
-    # Find next weekday 09:15
-    candidate = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
-    if now_ist >= candidate:
-        candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += timedelta(days=1)
-    delta = candidate - now_ist
-    h, rem = divmod(int(delta.total_seconds()), 3600)
-    m = rem // 60
-    return f"{h}h {m}m"
 
-# ── SCAN MARKET (batched) ─────────────────────────────────────────────────────
 def scan_market(universe, con):
     cache_cutoff = (datetime.now()-timedelta(hours=4)).isoformat()
     setups = []
@@ -387,7 +429,46 @@ def scan_market(universe, con):
     return top
 
 # ── MANAGE OPEN POSITIONS ─────────────────────────────────────────────────────
-def manage_positions(con):
+def check_rsi_divergence(sym: str, lookback: int = 5) -> tuple[bool, str]:
+    """
+    Bearish RSI divergence: price making higher highs but RSI making lower highs.
+    Returns (divergence_found, description).
+    """
+    try:
+        df = yf.Ticker(sym+".NS").history(
+            period="30d", interval="1d", timeout=8, auto_adjust=True
+        )
+        if len(df) < lookback + 5:
+            return False, "insufficient data"
+
+        c = df["Close"].values.astype(float)
+        rsi_list = calc_rsi(c, RSI_PERIOD)
+        if len(rsi_list) < lookback:
+            return False, "rsi too short"
+
+        # Compare last N bars
+        price_now  = c[-1]
+        price_prev = min(c[-(lookback+1):-1])   # lowest recent price
+        rsi_now    = rsi_list[-1]
+        rsi_high   = max(rsi_list[-(lookback+1):-1])  # highest recent RSI
+
+        # Bearish divergence: price >= recent high BUT RSI < recent RSI high
+        if price_now >= price_prev * 1.01 and rsi_now < rsi_high * 0.97:
+            return True, f"price+{((price_now/price_prev-1)*100):.1f}% rsi-{(rsi_high-rsi_now):.1f}pts"
+
+        return False, "no divergence"
+    except Exception as e:
+        return False, str(e)[:30]
+
+
+def manage_positions(con) -> None:
+    """
+    Exit rules (any one triggers exit):
+    1. Daily RSI drops below 50     → momentum gone
+    2. Weekly RSI drops below 55    → macro trend broken
+    3. Bearish RSI divergence        → price/RSI decoupling
+    4. Hard stop: price <= entry − 2×ATR
+    """
     cols = ["id","sym","direction","entry","sl","target","trail_sl","qty",
             "risk_amt","target_gain","rr","status","pnl","score","days_held",
             "opened_at","closed_at","exit_reason"]
@@ -400,7 +481,8 @@ def manage_positions(con):
         t = dict(zip(cols, row))
         try:
             hist = yf.Ticker(t["sym"]+".NS").history(
-                period="2d", interval="5m", timeout=8, auto_adjust=True)
+                period="5d", interval="1d", timeout=8, auto_adjust=True
+            )
             price = float(hist["Close"].iloc[-1]) if len(hist) > 0 else None
         except Exception:
             price = None
@@ -416,56 +498,64 @@ def manage_positions(con):
             days = 0
         con.execute("UPDATE trades SET days_held=? WHERE id=?", (days, t["id"]))
 
-        # Trailing stop: move to breakeven once price > entry + 1×ATR
-        atr_val     = abs(t["entry"] - t["sl"]) / ATR_STOP_MULT
-        be_trigger  = t["entry"] + atr_val
-        trail_sl    = t["trail_sl"]
-        if price >= be_trigger and trail_sl < t["entry"]:
-            trail_sl = t["entry"]
-            con.execute("UPDATE trades SET trail_sl=? WHERE id=?", (trail_sl, t["id"]))
+        exit_reason = None
+
+        # Exit 1: hard stop
+        if price <= t["sl"]:
+            exit_reason = "HARD_STOP"
+
+        # Exit 2: daily RSI < 50
+        if not exit_reason:
+            try:
+                df = yf.Ticker(t["sym"]+".NS").history(
+                    period="45d", interval="1d", timeout=8, auto_adjust=True
+                )
+                if len(df) >= RSI_PERIOD + 2:
+                    d_rsi = calc_rsi(df["Close"].values, RSI_PERIOD)
+                    if d_rsi and float(d_rsi[-1]) < DAILY_RSI_EXIT:
+                        exit_reason = f"DAILY_RSI_EXIT({float(d_rsi[-1]):.1f}<{DAILY_RSI_EXIT})"
+            except Exception:
+                pass
+
+        # Exit 3: weekly RSI < 55
+        if not exit_reason:
+            try:
+                weekly_rsi, _ = calc_weekly_rsi(t["sym"])
+                if weekly_rsi > 0 and weekly_rsi < WEEKLY_RSI_EXIT:
+                    exit_reason = f"WEEKLY_RSI_EXIT({weekly_rsi:.1f}<{WEEKLY_RSI_EXIT})"
+            except Exception:
+                pass
+
+        # Exit 4: bearish RSI divergence
+        if not exit_reason:
+            div, desc = check_rsi_divergence(t["sym"], DIVERGENCE_LOOKBACK)
+            if div:
+                exit_reason = f"DIVERGENCE({desc})"
+
+        if exit_reason:
+            pnl    = round((price - t["entry"]) * t["qty"], 2)
+            status = "win" if pnl > 0 else "loss"
+            con.execute(
+                "UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=? WHERE id=?",
+                (status, pnl, datetime.now().isoformat(), exit_reason, t["id"])
+            )
             con.commit()
-            log.info(f"  TRAIL {t['sym']}: stop → breakeven ₹{trail_sl}")
-
-        effective_sl = max(t["sl"], trail_sl)
-
-        # RSI overbought check
-        rsi_exit = False
-        try:
-            df = yf.Ticker(t["sym"]+".NS").history(
-                period="30d", interval="1d", timeout=8, auto_adjust=True)
-            if len(df) >= RSI_PERIOD + 2:
-                rsi_list = calc_rsi(df["Close"].values, RSI_PERIOD)
-                if rsi_list and rsi_list[-1] >= RSI_EXIT_OB:
-                    rsi_exit = True
-        except Exception:
-            pass
-
-        # Determine exit
-        if   price <= effective_sl:      reason = "SL_HIT"
-        elif price >= t["target"]:       reason = "TARGET_HIT"
-        elif days  >= TIME_STOP_DAYS:    reason = "TIME_STOP(5d)"
-        elif rsi_exit:                   reason = f"RSI_OB"
+            upd_stats(con, pnl=pnl,
+                      risk_used=abs(pnl) if pnl < 0 else 0,
+                      wins=1 if pnl > 0 else 0,
+                      losses=0 if pnl > 0 else 1,
+                      time_exits=0)
+            log.info(f"  CLOSED {t['sym']} [{exit_reason}] @ ₹{price:.2f} P&L ₹{pnl:+.2f}")
         else:
-            pnl_unreal = round((price-t["entry"])*t["qty"], 0)
-            log.info(f"  HOLD {t['sym']} @ ₹{price:.2f} "
-                     f"unrealised:₹{pnl_unreal:+.0f} "
-                     f"sl:₹{effective_sl:.2f} tgt:₹{t['target']} day:{days}/{TIME_STOP_DAYS}")
-            continue
+            pnl_unreal = round((price - t["entry"]) * t["qty"], 0)
+            log.info(
+                f"  HOLD {t['sym']} @ ₹{price:.2f} "
+                f"unrealised:₹{pnl_unreal:+.0f} "
+                f"sl:₹{t['sl']:.2f} day:{days}"
+            )
 
-        pnl    = round((price-t["entry"])*t["qty"], 2)
-        status = "win" if pnl > 0 else "loss"
-        con.execute("""UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=?
-                       WHERE id=?""",
-                    (status, pnl, datetime.now().isoformat(), reason, t["id"]))
-        con.commit()
-        upd_stats(con, pnl=pnl,
-                  risk_used=abs(pnl) if pnl<0 else 0,
-                  wins=1 if pnl>0 else 0,
-                  losses=0 if pnl>0 else 1,
-                  time_exits=1 if "TIME" in reason else 0)
-        log.info(f"  CLOSED {t['sym']} [{reason}] @ ₹{price:.2f} P&L ₹{pnl:+.2f}")
 
-# ── EXECUTE PAPER ORDER ───────────────────────────────────────────────────────
+
 def execute_order(setup, con, risk_left):
     risk_per = abs(setup["entry"] - setup["sl"])
     if risk_per <= 0: return False
@@ -515,8 +605,8 @@ def run():
     log.info("  ClaudeBot v4 · Pure Algo · NSE Swing")
     log.info("  Strategy: RSI cross + EMA trend + ATR size")
     log.info(f"  Capital:₹{CAPITAL:,}  Risk/week:₹{MAX_WEEKLY_RISK:,}")
-    log.info(f"  Params: RSI_zone:{RSI_ENTRY_LOW}-{RSI_ENTRY_HIGH} EMA:{EMA_FAST}/{EMA_SLOW} "
-             f"Vol:{VOL_MULT}x ATR:{ATR_MIN_PCT}-{ATR_MAX_PCT}%")
+    log.info(f"  Strategy: Weekly RSI>{WEEKLY_RSI_ENTRY} + Daily RSI>{DAILY_RSI_ENTRY} + MCap>₹{MIN_MCAP_CR}Cr "
+             f"Stop:entry-{ATR_STOP_MULT}xATR | Exit:RSI<{DAILY_RSI_EXIT} or divergence")
     log.info("════════════════════════════════════════════")
 
     con = init_db()
@@ -740,23 +830,23 @@ body{background:#080b0f;color:#a8b4c0;font-family:'IBM Plex Mono',monospace;font
   <div style="display:flex;flex-wrap:wrap;gap:16px">
     <div style="display:flex;align-items:center;gap:6px">
       <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Signal</span>
-      <span style="background:#031a0d;color:#00e676;border:1px solid #0d3a1a;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:1px">RSI MEAN REVERSION</span>
+      <span style="background:#031a0d;color:#00e676;border:1px solid #0d3a1a;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:1px">DUAL RSI MOMENTUM</span>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
       <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Entry</span>
-      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">RSI 28–42 · EMA20 &gt; EMA50 · Vol ≥ 1.2×</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Weekly RSI &gt; 60 · Daily RSI &gt; 60 · MCap &gt; ₹20,000 Cr</span>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
       <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Stop</span>
-      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Entry − 1.5 × ATR</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Entry − 2.0 × ATR (hard floor)</span>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
       <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Target</span>
-      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Entry + 3.0 × ATR &nbsp;·&nbsp; R:R 2.0×</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Entry + 3.0 × ATR · open-ended momentum ride</span>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
       <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Exit</span>
-      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">SL · Target · RSI &gt; 70 · 5-day time stop</span>
+      <span style="background:#0d1520;color:#a8b4c0;border:1px solid #1e2d3d;padding:2px 8px;border-radius:3px;font-size:10px">Daily RSI &lt; 50 · Weekly RSI &lt; 55 · Bearish divergence · Hard stop</span>
     </div>
     <div style="display:flex;align-items:center;gap:6px">
       <span style="font-size:9px;color:#3a5060;letter-spacing:1px;text-transform:uppercase">Universe</span>
