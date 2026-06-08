@@ -267,6 +267,32 @@ def screen(sym, cache_cutoff, con):
         (sym, reject, now))
     return None, reject
 
+# ── MARKET HOURS CHECK ───────────────────────────────────────────────────────
+def is_market_open() -> bool:
+    """NSE is open Mon–Fri 09:15–15:30 IST (UTC+5:30)."""
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = datetime.utcnow() + ist_offset
+    if now_ist.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now_ist <= market_close
+
+def time_to_open() -> str:
+    """Human-readable time until next NSE open."""
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = datetime.utcnow() + ist_offset
+    # Find next weekday 09:15
+    candidate = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now_ist >= candidate:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    delta = candidate - now_ist
+    h, rem = divmod(int(delta.total_seconds()), 3600)
+    m = rem // 60
+    return f"{h}h {m}m"
+
 # ── SCAN MARKET (batched) ─────────────────────────────────────────────────────
 def scan_market(universe, con):
     cache_cutoff = (datetime.now()-timedelta(hours=4)).isoformat()
@@ -284,19 +310,24 @@ def scan_market(universe, con):
                          f"vol:{setup['vol_ratio']}x atr:{setup['atr_pct']}% "
                          f"score:{setup['score']}")
             else:
-                # Bucket rejection reasons for summary
-                key = reason.split("(")[0] if reason else "unknown"
+                # strip cache: prefix to get real reason
+                real = reason.replace("cached:","") if reason else "unknown"
+                key  = real.split("(")[0]
                 reject_counts[key] = reject_counts.get(key, 0) + 1
 
         done = min(i+BATCH_SIZE, total)
-        log.info(f"  Scanned {done}/{total} — {len(setups)} setups found")
+        # Print rejection breakdown every 30 symbols so you see it mid-scan
+        top_rejects = " | ".join(
+            f"{k}:{v}" for k,v in
+            sorted(reject_counts.items(), key=lambda x:-x[1])[:4]
+        )
+        log.info(f"  Scanned {done}/{total} — {len(setups)} setups | {top_rejects}")
         if i+BATCH_SIZE < total:
             time.sleep(BATCH_PAUSE)
 
-    # Rejection summary
-    log.info("  Rejection breakdown: " +
-             " | ".join(f"{k}:{v}" for k,v in
-                        sorted(reject_counts.items(), key=lambda x:-x[1])[:6]))
+    log.info("  ── Final rejection breakdown ──")
+    for k,v in sorted(reject_counts.items(), key=lambda x:-x[1]):
+        log.info(f"     {k:<30} {v:>5} stocks")
 
     setups.sort(key=lambda x: x["score"], reverse=True)
     top = setups[:TOP_N]
@@ -454,12 +485,14 @@ def run():
         log.info("── Position management")
         manage_positions(con)
 
-        # 2. Check capacity
+        # 2. Check market hours + capacity
         stats   = get_stats(con)
         open_c  = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
 
-        if stats["risk_used"] >= MAX_WEEKLY_RISK:
-            log.warning(f"  Weekly risk limit ₹{MAX_WEEKLY_RISK} reached — no new trades")
+        if not is_market_open():
+            log.info(f"  NSE closed — next open in {time_to_open()} · sleeping {SCAN_INTERVAL}s")
+        elif stats["risk_used"] >= MAX_WEEKLY_RISK:
+            log.warning(f"  Weekly risk limit u20b9{MAX_WEEKLY_RISK} reached — no new trades")
         elif open_c >= MAX_OPEN:
             log.info(f"  Positions full ({open_c}/{MAX_OPEN}) — skipping scan")
         else:
@@ -473,7 +506,7 @@ def run():
             for s in setups:
                 open_c = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
                 if open_c >= MAX_OPEN: break
-                if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'",(s["sym"],)).fetchone():
+                if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'", (s["sym"],)).fetchone():
                     continue
                 if execute_order(s, con, risk_left):
                     risk_left -= min(RISK_PER_TRADE, abs(s["entry"]-s["sl"]))
