@@ -115,7 +115,7 @@ def init_db():
 
 # ── MARKET HOURS ─────────────────────────────────────────────────────────────
 def ist_now():
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+    return datetime.now(tz=__import__("datetime").timezone.utc).replace(tzinfo=None) + timedelta(hours=5, minutes=30)
 
 def is_market_open():
     t = ist_now()
