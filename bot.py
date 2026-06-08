@@ -677,21 +677,11 @@ def run():
         elif open_c >= MAX_OPEN:
             log.info(f"  Positions full ({open_c}/{MAX_OPEN}) — skipping scan")
         else:
-            # 3. Scan market
-            log.info(f"── Market scan (capacity: {MAX_OPEN-open_c} slots)")
-            universe = fetch_universe()
-            setups   = scan_market(universe, con)
+            # 3. Scan market and execute immediately on find
+            log.info(f"── Market scan (execute on find)")
+            universe  = fetch_universe()
             risk_left = MAX_WEEKLY_RISK - stats["risk_used"]
-
-            entered = 0
-            for s in setups:
-                open_c = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
-                if open_c >= MAX_OPEN: break
-                if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'", (s["sym"],)).fetchone():
-                    continue
-                if execute_order(s, con, risk_left):
-                    risk_left -= min(RISK_PER_TRADE, abs(s["entry"]-s["sl"]))
-                    entered += 1
+            entered   = scan_and_trade(universe, con, risk_left)
             if not entered:
                 log.info("  No new positions opened this cycle")
 
