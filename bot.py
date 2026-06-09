@@ -118,7 +118,8 @@ def init_db():
         pnl        REAL DEFAULT 0,
         risk_used  REAL DEFAULT 0,
         wins       INTEGER DEFAULT 0,
-        losses     INTEGER DEFAULT 0
+        losses     INTEGER DEFAULT 0,
+        time_exits INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS screener_cache (
         sym          TEXT PRIMARY KEY,
@@ -384,7 +385,7 @@ def manage_positions(con):
             )
             con.commit()
             ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-            con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0)", (ws,))
+            con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
             con.execute(
                 "UPDATE weekly_stats SET pnl=pnl+?,risk_used=risk_used+?,"
                 "wins=wins+?,losses=losses+? WHERE week_start=?",
@@ -448,7 +449,7 @@ def scan_and_trade(universe, con):
                  f"Rs.{s['entry']:>8.2f}")
 
     ws        = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0)", (ws,))
+    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
     stats_row = con.execute(
         "SELECT risk_used FROM weekly_stats WHERE week_start=?", (ws,)
     ).fetchone()
@@ -504,7 +505,7 @@ def scan_and_trade(universe, con):
 # ── WEEKLY STATS ──────────────────────────────────────────────────────────────
 def get_stats(con):
     ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0)", (ws,))
+    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
     con.commit()
     r = con.execute(
         "SELECT pnl,risk_used,wins,losses FROM weekly_stats WHERE week_start=?", (ws,)
@@ -948,7 +949,7 @@ def start_dashboard():
 
             # Weekly stats
             ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-            con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0)", (ws,))
+            con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
             con.commit()
             row = con.execute(
                 "SELECT pnl,risk_used,wins,losses FROM weekly_stats WHERE week_start=?", (ws,)
@@ -1117,6 +1118,13 @@ def run():
     con.commit()
     log.info("  Screener cache reset — fresh build on next scan")
 
+    # Migrate weekly_stats schema if needed (add time_exits if missing)
+    cols = [r[1] for r in con.execute("PRAGMA table_info(weekly_stats)").fetchall()]
+    if "time_exits" not in cols:
+        con.execute("ALTER TABLE weekly_stats ADD COLUMN time_exits INTEGER DEFAULT 0")
+        con.commit()
+        log.info("  Migrated weekly_stats: added time_exits column")
+
     # Enforce MAX_OPEN on boot — keep top N by score, cancel rest with real P&L
     open_rows = con.execute(
         "SELECT id,sym,score,entry,qty FROM trades WHERE status='open' ORDER BY score DESC"
@@ -1124,7 +1132,7 @@ def run():
     if len(open_rows) > MAX_OPEN:
         excess = open_rows[MAX_OPEN:]
         ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-        con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0)", (ws,))
+        con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
         net_pnl = 0.0
         for tid, sym, score, entry, qty in excess:
             qty = qty or 1
