@@ -750,13 +750,36 @@ refresh();setInterval(refresh,5000);
             closed = []
             for r in closed_rows:
                 sym,entry,pnl,status,exit_reason,qty = r
-                # Retroactively compute P&L for EXCESS_ON_BOOT trades with pnl=0
-                if pnl == 0 and exit_reason and 'EXCESS' in exit_reason and qty:
-                    cached = con.execute("SELECT price FROM screener_cache WHERE sym=?",(sym,)).fetchone()
-                    if cached and cached[0]:
-                        pnl = round((float(cached[0]) - entry) * qty, 2)
+                qty = qty or 1
+                # Retroactively compute P&L for cancelled trades with pnl=0
+                if (pnl == 0 or pnl is None) and exit_reason and 'EXCESS' in exit_reason:
+                    # Try screener cache first
+                    cached = con.execute(
+                        "SELECT price FROM screener_cache WHERE sym=?",(sym,)
+                    ).fetchone()
+                    last_price = float(cached[0]) if cached and cached[0] else None
+                    # Fall back to yfinance if no cache
+                    if not last_price:
+                        try:
+                            import yfinance as _yf2
+                            h = _yf2.Ticker(sym+".NS").history(
+                                period="2d",interval="1d",timeout=5,auto_adjust=True)
+                            if len(h) > 0:
+                                last_price = float(h["Close"].iloc[-1])
+                        except Exception:
+                            last_price = entry
+                    last_price = last_price or entry
+                    pnl = round((last_price - entry) * qty, 2)
+                    # Update DB so next load is instant
+                    new_status = "win" if pnl > 0 else ("loss" if pnl < 0 else "cancelled")
+                    con.execute(
+                        "UPDATE trades SET pnl=?, status=? WHERE sym=? AND exit_reason LIKE '%EXCESS%' AND pnl=0",
+                        (pnl, new_status, sym)
+                    )
+                pnl = pnl or 0
                 closed.append({"sym":sym,"entry":entry,"pnl":pnl,
-                               "status":status,"exit_reason":exit_reason})
+                               "status":status or "cancelled","exit_reason":exit_reason})
+            con.commit()
             con.close()
             logs = []
             try:
