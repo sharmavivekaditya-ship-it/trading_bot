@@ -51,6 +51,7 @@ SCAN_INTERVAL    = 300
 BATCH_SIZE       = 50
 BATCH_PAUSE      = 1
 TOP_N            = 5          # trade top 5 setups by score
+MAX_OPEN         = 5          # hard cap — stop scanning when 5 positions open
 
 MIN_PRICE        = 50
 MAX_PRICE        = 50_000
@@ -412,14 +413,23 @@ def scan_and_trade(universe, con, risk_left):
 
     placed = 0
     for s in top5:
-        if risk_left <= 0: break
+        # Hard stop — never exceed MAX_OPEN positions
+        current_open = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+        if current_open >= MAX_OPEN:
+            log.info(f"  Portfolio full ({current_open}/{MAX_OPEN}) — stopping")
+            break
+        if risk_left <= 0:
+            log.info("  Risk budget exhausted")
+            break
         if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'",(s["sym"],)).fetchone():
+            log.info(f"  SKIP {s['sym']} — already open")
             continue
         if execute_order(s, con, risk_left):
-            risk_left -= min(RISK_PER_TRADE, abs(s["entry"]-s["sl"]) *
-                           max(1, int(min(risk_left, RISK_PER_TRADE)/max(0.01,abs(s["entry"]-s["sl"])))))
+            rp = abs(s["entry"]-s["sl"])
+            qty = max(1, int(min(risk_left, RISK_PER_TRADE)/max(0.01,rp)))
+            risk_left -= min(RISK_PER_TRADE, qty * rp)
             placed += 1
-    log.info(f"  {placed} orders placed")
+    log.info(f"  {placed} orders placed | portfolio now {con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]}/{MAX_OPEN}")
     return placed
 
 # ── STATS ─────────────────────────────────────────────────────────────────────
@@ -608,9 +618,11 @@ async function refresh(){
     document.getElementById('mp').textContent='Rs.'+port.toLocaleString('en-IN');
     document.getElementById('mp-s').textContent=`base Rs.1,00,000 · unreal ${unreal>=0?'+':''}Rs.${Math.abs(Math.round(unreal)).toLocaleString('en-IN')}`;
     const mw=document.getElementById('mw');
-    mw.textContent=(s.pnl>=0?'+Rs.':'-Rs.')+Math.abs(s.pnl).toLocaleString('en-IN');
-    mw.className='mv '+(s.pnl>=0?'g':'r');
-    document.getElementById('mw-s').textContent=((s.pnl/CAP)*100).toFixed(2)+'% of capital';
+    const totalPnL = s.pnl + unreal;
+    mw.textContent=(totalPnL>=0?'+Rs.':'-Rs.')+Math.abs(Math.round(totalPnL)).toLocaleString('en-IN');
+    mw.className='mv '+(totalPnL>=0?'g':'r');
+    document.getElementById('mw-s').textContent=
+      `closed ${s.pnl>=0?'+':''}Rs.${Math.round(s.pnl).toLocaleString('en-IN')} · unreal ${unreal>=0?'+':''}Rs.${Math.abs(Math.round(unreal)).toLocaleString('en-IN')}`;
     const tot=s.wins+s.losses;
     document.getElementById('mwr').textContent=tot?Math.round(s.wins/tot*100)+'%':'—';
     document.getElementById('mwr-s').textContent=s.wins+'W / '+s.losses+'L';
@@ -623,7 +635,9 @@ async function refresh(){
     rf.style.width=Math.min(100,rp)+'%';
     rf.style.background=rp>80?'#ff5252':rp>50?'#ffab40':'#00e676';
     document.getElementById('rl').textContent='Risk: Rs.'+s.risk_used+' of Rs.3,000 weekly budget ('+rp+'%)';
-    document.getElementById('op-b').textContent=d.open.length+' OPEN';
+    document.getElementById('op-b').textContent=
+      d.open.length>=5 ? '⬛ FULL ('+d.open.length+'/5)' : d.open.length+'/5 OPEN';
+    document.getElementById('op-b').style.color = d.open.length>=5 ? '#ff5252' : '#ffab40';
     document.getElementById('op').innerHTML=d.open.length?d.open.map(t=>{
       const u=t.unrealised||0,uc=u>=0?'#00e676':'#ff5252',us=u>=0?'+':'';
       const range=Math.abs(t.target-t.sl),moved=Math.abs((t.last_price||t.entry)-t.entry);
@@ -633,7 +647,7 @@ async function refresh(){
         <div class="tm">Last Rs.${(t.last_price||t.entry).toLocaleString('en-IN')} · Entry Rs.${t.entry} · Day ${t.days_held}/5<br>
         SL Rs.${t.sl} · TGT Rs.${t.target} · R:R ${t.rr}x · Qty ${t.qty||'—'}</div>
         <div class="pbar"><div class="pbar-fill" style="width:${prog}%;background:${uc}"></div></div></div>`;
-    }).join(''):'<div class="empty">No open positions<br><span style="font-size:10px;color:#1a3020">Scanning for Dual RSI momentum setups</span></div>';
+    }).join(''):'<div class="empty">No open positions<br><span style="font-size:10px;color:#1a3020">Bot scanning for top 5 Dual RSI setups</span></div>';
     const wins=d.closed.filter(t=>t.status==='win').length;
     document.getElementById('ct-b').textContent=d.closed.length+' CLOSED';
     document.getElementById('ct').innerHTML=d.closed.length?d.closed.map(t=>
@@ -644,7 +658,7 @@ async function refresh(){
     document.getElementById('lg').innerHTML=d.logs.length?d.logs.map(l=>`<div class="${lc(l)}">${l}</div>`).join(''):'<div class="d">No log entries yet</div>';
   }catch(e){document.getElementById('conn').style.color='#ff5252';}
 }
-refresh();setInterval(refresh,10000);
+refresh();setInterval(refresh,5000);
 </script></body></html>"""
 
     @app.route("/")
@@ -673,9 +687,19 @@ refresh();setInterval(refresh,10000);
             open_t = [dict(r) for r in con.execute(
                 "SELECT sym,entry,sl,target,rr,risk_amt,days_held,qty FROM trades WHERE status='open'"
             ).fetchall()]
+            # Fetch live prices for open positions
             for t in open_t:
-                row = con.execute("SELECT price FROM screener_cache WHERE sym=?",(t["sym"],)).fetchone()
-                t["last_price"] = round(float(row[0]),2) if row and row[0] else t["entry"]
+                try:
+                    import yfinance as _yf
+                    hist = _yf.Ticker(t["sym"]+".NS").history(period="1d",interval="1m",timeout=5,auto_adjust=True)
+                    if hist is not None and len(hist) > 0:
+                        t["last_price"] = round(float(hist["Close"].iloc[-1]),2)
+                    else:
+                        row = con.execute("SELECT price FROM screener_cache WHERE sym=?",(t["sym"],)).fetchone()
+                        t["last_price"] = round(float(row[0]),2) if row and row[0] else t["entry"]
+                except Exception:
+                    row = con.execute("SELECT price FROM screener_cache WHERE sym=?",(t["sym"],)).fetchone()
+                    t["last_price"] = round(float(row[0]),2) if row and row[0] else t["entry"]
                 t["unrealised"] = round((t["last_price"]-t["entry"])*t["qty"],2)
                 t["unreal_pct"] = round((t["last_price"]-t["entry"])/t["entry"]*100,2)
             closed = [dict(r) for r in con.execute(
@@ -723,6 +747,18 @@ def run():
     con.commit()
     if wiped: log.info(f"  Cleared {wiped} stale cache entries")
 
+    # Enforce MAX_OPEN — keep only top MAX_OPEN positions by score, cancel excess
+    open_trades = con.execute(
+        "SELECT id, sym, score FROM trades WHERE status='open' ORDER BY score DESC"
+    ).fetchall()
+    if len(open_trades) > MAX_OPEN:
+        excess = open_trades[MAX_OPEN:]
+        for row in excess:
+            con.execute("UPDATE trades SET status='cancelled', exit_reason='EXCESS_ON_BOOT' WHERE id=?", (row[0],))
+            log.info(f"  CANCELLED excess position: {row[1]} (score:{row[2]})")
+        con.commit()
+        log.info(f"  Enforced MAX_OPEN={MAX_OPEN}: kept top {MAX_OPEN}, cancelled {len(excess)} excess")
+
     cycle = 0
     while True:
         cycle += 1
@@ -737,9 +773,12 @@ def run():
         if not is_market_open():
             log.info(f"  NSE closed — next open in {time_to_open()}")
         elif stats["risk_used"] >= MAX_WEEKLY_RISK:
-            log.warning("  Weekly risk limit reached")
+            log.warning("  Weekly risk limit reached — no new trades this week")
+        elif open_c >= MAX_OPEN:
+            log.info(f"  Portfolio full ({open_c}/{MAX_OPEN}) — monitoring only, no scan")
         else:
-            log.info(f"-- Market scan")
+            slots = MAX_OPEN - open_c
+            log.info(f"-- Market scan ({slots} slot{'s' if slots>1 else ''} available)")
             universe  = fetch_universe()
             risk_left = MAX_WEEKLY_RISK - stats["risk_used"]
             scan_and_trade(universe, con, risk_left)
@@ -748,6 +787,8 @@ def run():
         open_c = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
         total  = stats["wins"] + stats["losses"]
         wr     = round(stats["wins"]/total*100) if total else 0
+        # Compute total unrealised from open positions
+        open_rows = con.execute("SELECT entry,qty FROM trades WHERE status='open'").fetchall()
         log.info(f"\n  P&L: Rs.{stats['pnl']:+.0f}  Risk: Rs.{stats['risk_used']:.0f}/Rs.{MAX_WEEKLY_RISK}"
                  f"  W/L: {stats['wins']}/{stats['losses']} ({wr}%)  Open: {open_c}")
         log.info(f"  Sleeping {SCAN_INTERVAL}s\n")
