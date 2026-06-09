@@ -749,15 +749,42 @@ def run():
 
     # Enforce MAX_OPEN — keep only top MAX_OPEN positions by score, cancel excess
     open_trades = con.execute(
-        "SELECT id, sym, score FROM trades WHERE status='open' ORDER BY score DESC"
+        "SELECT id, sym, score, entry, qty FROM trades WHERE status='open' ORDER BY score DESC"
     ).fetchall()
     if len(open_trades) > MAX_OPEN:
         excess = open_trades[MAX_OPEN:]
+        total_cancelled_pnl = 0
         for row in excess:
-            con.execute("UPDATE trades SET status='cancelled', exit_reason='EXCESS_ON_BOOT' WHERE id=?", (row[0],))
-            log.info(f"  CANCELLED excess position: {row[1]} (score:{row[2]})")
+            tid, sym, score, entry, qty = row
+            # Fetch last known price to compute actual P&L
+            try:
+                cached = con.execute(
+                    "SELECT price FROM screener_cache WHERE sym=?", (sym,)
+                ).fetchone()
+                last_price = float(cached[0]) if cached and cached[0] else entry
+                pnl = round((last_price - entry) * qty, 2)
+            except Exception:
+                pnl = 0.0
+                last_price = entry
+            status = 'win' if pnl > 0 else ('loss' if pnl < 0 else 'cancelled')
+            con.execute(
+                "UPDATE trades SET status=?, pnl=?, closed_at=?, exit_reason='EXCESS_CANCELLED' WHERE id=?",
+                (status, pnl, datetime.now().isoformat(), tid)
+            )
+            total_cancelled_pnl += pnl
+            log.info(f"  CANCELLED {sym} @ Rs.{last_price:.2f} P&L Rs.{pnl:+.2f} (score:{score})")
         con.commit()
-        log.info(f"  Enforced MAX_OPEN={MAX_OPEN}: kept top {MAX_OPEN}, cancelled {len(excess)} excess")
+        # Update weekly stats with cancelled P&L
+        ws = (date.today()-timedelta(days=date.today().weekday())).isoformat()
+        con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)",(ws,))
+        con.execute(
+            "UPDATE weekly_stats SET pnl=pnl+? WHERE week_start=?",
+            (round(total_cancelled_pnl,2), ws)
+        )
+        con.commit()
+        log.info(
+            f"  Enforced MAX_OPEN={MAX_OPEN}: kept top {MAX_OPEN}, "            f"cancelled {len(excess)} excess | net P&L Rs.{total_cancelled_pnl:+.2f}"
+        )
 
     cycle = 0
     while True:
