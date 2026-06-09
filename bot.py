@@ -582,7 +582,28 @@ function mktState(){
   return{state:'closed',label:'MARKET CLOSED',sub:'Reopens tomorrow 09:15 IST'};
 }
 function secUntil(th,tm){const t=nowIST();let s=(th-t.getUTCHours())*3600+(tm-t.getUTCMinutes())*60-t.getUTCSeconds();if(s<0)s+=86400;return s;}
-function secUntilNextWeekday(th,tm){const t=nowIST();let d=new Date(t);for(let i=0;i<7;i++){const day=d.getUTCDay(),h=d.getUTCHours(),m=d.getUTCMinutes(),s=d.getUTCSeconds();if(day>=1&&day<=5&&(i>0||(h*60+m)<th*60+tm)){let sec=(th-h)*3600+(tm-m)*60-s;if(sec<0&&i===0)sec+=86400;return Math.max(0,sec);}d=new Date(d.getTime()+86400000);}return 0;}
+function secUntilNextWeekday(th,tm){
+  const t=nowIST();
+  let d=new Date(t.getTime());
+  for(let i=0;i<8;i++){
+    const day=d.getUTCDay();
+    if(day>=1&&day<=5){
+      const h=d.getUTCHours(),m=d.getUTCMinutes(),s=d.getUTCSeconds();
+      const targetMins=th*60+tm, curMins=h*60+m;
+      if(i===0&&curMins<targetMins){
+        return Math.max(0,(th-h)*3600+(tm-m)*60-s);
+      } else if(i>0){
+        // Next weekday — time from start of that day to target
+        const secsUntilMidnight=(23-h)*3600+(59-m)*60+(60-s);
+        const secsFromMidnight=th*3600+tm*60;
+        return secsUntilMidnight+secsFromMidnight;
+      }
+    }
+    d=new Date(d.getTime()+86400000);
+    d=new Date(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate(),0,0,0));
+  }
+  return 0;
+}
 function tick(){
   const t=nowIST();
   document.getElementById('ist').textContent=`${String(t.getUTCHours()).padStart(2,'0')}:${String(t.getUTCMinutes()).padStart(2,'0')}:${String(t.getUTCSeconds()).padStart(2,'0')} IST`;
@@ -640,21 +661,41 @@ async function refresh(){
     document.getElementById('op-b').style.color = d.open.length>=5 ? '#ff5252' : '#ffab40';
     document.getElementById('op').innerHTML=d.open.length?d.open.map(t=>{
       const u=t.unrealised||0,uc=u>=0?'#00e676':'#ff5252',us=u>=0?'+':'';
-      const range=Math.abs(t.target-t.sl),moved=Math.abs((t.last_price||t.entry)-t.entry);
-      const prog=range>0?Math.min(100,moved/range*100):0;
-      return `<div class="tc open"><div class="tr"><span class="ts">${t.sym} <span style="font-size:9px;color:#3a5060">BUY</span></span>
-        <span style="color:${uc};font-weight:600">${us}Rs.${Math.abs(u).toLocaleString('en-IN')} (${us}${t.unreal_pct||0}%)</span></div>
-        <div class="tm">Last Rs.${(t.last_price||t.entry).toLocaleString('en-IN')} · Entry Rs.${t.entry} · Day ${t.days_held}/5<br>
-        SL Rs.${t.sl} · TGT Rs.${t.target} · R:R ${t.rr}x · Qty ${t.qty||'—'}</div>
-        <div class="pbar"><div class="pbar-fill" style="width:${prog}%;background:${uc}"></div></div></div>`;
-    }).join(''):'<div class="empty">No open positions<br><span style="font-size:10px;color:#1a3020">Bot scanning for top 5 Dual RSI setups</span></div>';
+      const totalRange=Math.abs(t.target-t.sl);
+      const pricePos=(t.last_price||t.entry)-t.sl;
+      const prog=totalRange>0?Math.min(100,Math.max(0,pricePos/totalRange*100)):50;
+      const entryPct=totalRange>0?Math.min(100,Math.max(0,(t.entry-t.sl)/totalRange*100)):50;
+      return `<div class="tc open">
+        <div class="tr">
+          <span class="ts">${t.sym} <span style="font-size:9px;color:#3a5060">BUY · Day ${t.days_held}/5</span></span>
+          <span style="color:${uc};font-weight:600;font-size:13px">${us}Rs.${Math.abs(u).toLocaleString('en-IN')} <span style="font-size:10px">(${us}${t.unreal_pct||0}%)</span></span>
+        </div>
+        <div class="tm" style="margin:4px 0">
+          Last <b style="color:#c8d8e8">Rs.${(t.last_price||t.entry).toLocaleString('en-IN')}</b> &nbsp;·&nbsp; Entry Rs.${t.entry} &nbsp;·&nbsp; Qty ${t.qty||'—'}<br>
+          SL <span style="color:#ff5252">Rs.${t.sl}</span> &nbsp;·&nbsp; TGT <span style="color:#00e676">Rs.${t.target}</span> &nbsp;·&nbsp; R:R ${t.rr}x
+        </div>
+        <div style="position:relative;height:6px;background:#0a1520;border-radius:3px;overflow:hidden;margin-top:6px">
+          <div style="position:absolute;left:0;top:0;height:100%;width:${prog.toFixed(1)}%;background:${uc};border-radius:3px;transition:width .5s"></div>
+          <div style="position:absolute;left:${entryPct.toFixed(1)}%;top:0;width:2px;height:100%;background:#ffab40"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:9px;color:#2a4050;margin-top:2px">
+          <span>SL Rs.${t.sl}</span><span style="color:#ffab40">&#9650; Entry</span><span>TGT Rs.${t.target}</span>
+        </div>
+      </div>`;
     const wins=d.closed.filter(t=>t.status==='win').length;
     document.getElementById('ct-b').textContent=d.closed.length+' CLOSED';
-    document.getElementById('ct').innerHTML=d.closed.length?d.closed.map(t=>
-      `<div class="tc ${t.status}"><div class="tr"><span class="ts">${t.sym}</span>
-      <span class="tp ${t.pnl>=0?'p':'n'}">${t.pnl>=0?'+Rs.':'-Rs.'}${Math.abs(t.pnl).toLocaleString('en-IN')}</span></div>
-      <div class="tm">${t.exit_reason||t.status.toUpperCase()} · Entry Rs.${t.entry}</div></div>`
-    ).join(''):'<div class="empty">No closed trades yet</div>';
+    document.getElementById('ct').innerHTML=d.closed.length?d.closed.map(t=>{
+      const pc=t.pnl>=0?'#00e676':'#ff5252';
+      const ps=t.pnl>=0?'+Rs.':'-Rs.';
+      const reason=(t.exit_reason||t.status||'').replace('EXCESS_ON_BOOT','CANCELLED').replace('EXCESS_CANCELLED','CANCELLED');
+      return `<div class="tc ${t.status||'loss'}">
+        <div class="tr">
+          <span class="ts">${t.sym}</span>
+          <span style="color:${pc};font-weight:600">${ps}${Math.abs(t.pnl).toLocaleString('en-IN')}</span>
+        </div>
+        <div class="tm">${reason} · Entry Rs.${t.entry}</div>
+      </div>`;
+    }).join(''):'<div class="empty">No closed trades yet</div>';
     document.getElementById('lg').innerHTML=d.logs.length?d.logs.map(l=>`<div class="${lc(l)}">${l}</div>`).join(''):'<div class="d">No log entries yet</div>';
   }catch(e){document.getElementById('conn').style.color='#ff5252';}
 }
@@ -702,9 +743,19 @@ refresh();setInterval(refresh,5000);
                     t["last_price"] = round(float(row[0]),2) if row and row[0] else t["entry"]
                 t["unrealised"] = round((t["last_price"]-t["entry"])*t["qty"],2)
                 t["unreal_pct"] = round((t["last_price"]-t["entry"])/t["entry"]*100,2)
-            closed = [dict(r) for r in con.execute(
-                "SELECT sym,entry,pnl,status,exit_reason FROM trades WHERE status!='open' ORDER BY closed_at DESC LIMIT 15"
-            ).fetchall()]
+            closed_rows = con.execute(
+                "SELECT sym,entry,pnl,status,exit_reason,qty FROM trades WHERE status!='open' ORDER BY closed_at DESC LIMIT 20"
+            ).fetchall()
+            closed = []
+            for r in closed_rows:
+                sym,entry,pnl,status,exit_reason,qty = r
+                # Retroactively compute P&L for EXCESS_ON_BOOT trades with pnl=0
+                if pnl == 0 and exit_reason and 'EXCESS' in exit_reason and qty:
+                    cached = con.execute("SELECT price FROM screener_cache WHERE sym=?",(sym,)).fetchone()
+                    if cached and cached[0]:
+                        pnl = round((float(cached[0]) - entry) * qty, 2)
+                closed.append({"sym":sym,"entry":entry,"pnl":pnl,
+                               "status":status,"exit_reason":exit_reason})
             con.close()
             logs = []
             try:
