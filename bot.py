@@ -508,9 +508,22 @@ def get_stats(con):
     con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
     con.commit()
     r = con.execute(
-        "SELECT pnl,risk_used,wins,losses FROM weekly_stats WHERE week_start=?", (ws,)
+        "SELECT risk_used,wins,losses FROM weekly_stats WHERE week_start=?", (ws,)
     ).fetchone()
-    return {"pnl": r[0], "risk_used": r[1], "wins": r[2], "losses": r[3]}
+    # Compute P&L directly from closed trades this week — ground truth
+    week_start_dt = ws + "T00:00:00"
+    pnl_row = con.execute(
+        "SELECT COALESCE(SUM(pnl),0) FROM trades "
+        "WHERE status IN ('win','loss','cancelled') "
+        "AND closed_at >= ?", (week_start_dt,)
+    ).fetchone()
+    real_pnl = float(pnl_row[0]) if pnl_row and pnl_row[0] is not None else 0.0
+    return {
+        "pnl":       real_pnl,
+        "risk_used": float(r[0] or 0),
+        "wins":      int(r[1] or 0),
+        "losses":    int(r[2] or 0),
+    }
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1052,6 +1065,19 @@ def start_dashboard():
                 })
 
             if needs_commit:
+                # Update weekly_stats with newly computed P&L
+                ws2 = (date.today()-timedelta(days=date.today().weekday())).isoformat()
+                con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)",(ws2,))
+                # Sum all EXCESS_CANCELLED P&L from closed_list
+                excess_pnl = sum(
+                    t["pnl"] for t in closed_list
+                    if t.get("exit_reason","") and "EXCESS" in t["exit_reason"]
+                )
+                if excess_pnl != 0:
+                    con.execute(
+                        "UPDATE weekly_stats SET pnl=? WHERE week_start=?",
+                        (excess_pnl, ws2)
+                    )
                 con.commit()
             con.close()
 
