@@ -682,6 +682,7 @@ async function refresh(){
           <span>SL Rs.${t.sl}</span><span style="color:#ffab40">&#9650; Entry</span><span>TGT Rs.${t.target}</span>
         </div>
       </div>`;
+    }).join(''):'<div class="empty">No open positions<br><span style="font-size:10px;color:#1a3020">Bot scanning for top 5 Dual RSI setups</span></div>';
     const wins=d.closed.filter(t=>t.status==='win').length;
     document.getElementById('ct-b').textContent=d.closed.length+' CLOSED';
     document.getElementById('ct').innerHTML=d.closed.length?d.closed.map(t=>{
