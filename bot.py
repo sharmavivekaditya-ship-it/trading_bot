@@ -780,8 +780,8 @@ tickClock();
 
 // ── Log line colouring ────────────────────────────────────────────────────────
 function logClass(l) {
-  if (/BUY|SETUP|[+]Rs/.test(l))                        return 'lg2';
-  if (/ERROR|STOP|\-Rs|CLOSED.*loss/.test(l))          return 'lr';
+  if (/BUY|SETUP|[+]Rs/.test(l)) return 'lg2';
+  if (/ERROR|STOP|[-]Rs|CLOSED.*loss/.test(l))          return 'lr';
   if (/HOLD|WARNING|DIVERGENCE|CANCELLED/.test(l))     return 'la';
   if (/Cycle|Scan|Pass|Pass 1|Pass 2/.test(l))         return 'lb';
   return 'lg';
@@ -1105,13 +1105,17 @@ def run():
 
     con = init_db()
 
-    # Clear bad cache entries
-    wiped = con.execute(
-        "DELETE FROM screener_cache WHERE reject='no_data' OR reject='error'"
-    ).rowcount
+    # Drop and recreate screener_cache to ensure correct schema
+    # (safe to drop — rebuilt automatically on next scan)
+    con.execute("DROP TABLE IF EXISTS screener_cache")
+    con.execute("""CREATE TABLE IF NOT EXISTS screener_cache (
+        sym TEXT PRIMARY KEY, price REAL, daily_rsi REAL,
+        weekly_rsi REAL, atr REAL, score REAL,
+        entry REAL, sl REAL, target REAL,
+        reject TEXT, updated_at TEXT
+    )""")
     con.commit()
-    if wiped:
-        log.info(f"  Cleared {wiped} stale cache entries")
+    log.info("  Screener cache reset — fresh build on next scan")
 
     # Enforce MAX_OPEN on boot — keep top N by score, cancel rest with real P&L
     open_rows = con.execute(
