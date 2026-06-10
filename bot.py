@@ -60,14 +60,17 @@ BATCH_PAUSE      = 1
 MIN_PRICE        = 50
 MAX_PRICE        = 50_000
 MIN_AVG_VOL      = 200_000
+MIN_VOL_RATIO    = 0.8         # today's volume must be at least 80% of 20d avg
 MIN_MCAP_CR      = 20_000      # Rs. Crores
 
 # Strategy parameters
 RSI_PERIOD       = 14
-WEEKLY_RSI_MIN   = 60          # entry: weekly RSI must be above this
-DAILY_RSI_MIN    = 60          # entry: daily RSI must be above this
-DAILY_RSI_EXIT   = 50          # exit: daily RSI drops below this
-WEEKLY_RSI_EXIT  = 55          # exit: weekly RSI drops below this
+WEEKLY_RSI_MIN   = 57          # entry: weekly RSI floor (fresh momentum)
+WEEKLY_RSI_MAX   = 67          # entry: weekly RSI ceiling (not overextended)
+DAILY_RSI_MIN    = 57          # entry: daily RSI floor
+DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
+DAILY_RSI_EXIT   = 48          # exit: daily RSI drops below this
+WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
 ATR_STOP_MULT    = 2.0         # stop  = entry - 2*ATR
 ATR_TARGET_MULT  = 3.0         # target = entry + 3*ATR  → R:R = 1.5
@@ -264,23 +267,46 @@ def screen(sym, cache_cutoff, con):
                     d_rsi = rsi(c, RSI_PERIOD)
                     if not d_rsi:
                         reject = "rsi_error"
-                    elif float(d_rsi[-1]) <= DAILY_RSI_MIN:
+                    elif float(d_rsi[-1]) < DAILY_RSI_MIN:
                         reject = f"daily_rsi_low({float(d_rsi[-1]):.0f})"
+                    elif float(d_rsi[-1]) > DAILY_RSI_MAX:
+                        reject = f"daily_rsi_high({float(d_rsi[-1]):.0f})"  # overbought
                     else:
                         drsi_val = float(d_rsi[-1])
                         wrsi_val = weekly_rsi(sym)
-                        if wrsi_val <= WEEKLY_RSI_MIN:
+                        if wrsi_val < WEEKLY_RSI_MIN:
                             reject = f"weekly_rsi_low({wrsi_val:.0f})"
+                        elif wrsi_val > WEEKLY_RSI_MAX:
+                            reject = f"weekly_rsi_high({wrsi_val:.0f})"  # overbought weekly
                         else:
-                            atr_val = atr(h, lo, c, ATR_PERIOD)
-                            entry   = round(price, 2)
-                            sl      = round(entry - ATR_STOP_MULT * atr_val, 2)
-                            target  = round(entry + ATR_TARGET_MULT * atr_val, 2)
-                            score   = round(
-                                (wrsi_val  - 60) * 0.5 +
-                                (drsi_val  - 60) * 0.5 +
-                                min(20, (mcap / 100_000) * 5), 1
-                            )
+                            # Quality filter 1: RSI must be rising (not falling into range)
+                            rsi_prev = float(d_rsi[-2]) if len(d_rsi) >= 2 else drsi_val
+                            if drsi_val < rsi_prev - 3:
+                                reject = f"rsi_falling({drsi_val:.0f}<{rsi_prev:.0f})"
+                            # Quality filter 2: price above 20-day EMA (uptrend only)
+                            elif price < float(pd.Series(c).ewm(span=20, adjust=False).mean().iloc[-1]) * 0.98:
+                                reject = "below_ema20"
+                            # Quality filter 3: not in last 5% of ATR move (not stretched)
+                            else:
+                                atr_val = atr(h, lo, c, ATR_PERIOD)
+                                # Check if price has already moved > 1.5x ATR from 10d low
+                                low_10d = float(np.min(lo[-10:]))
+                                if price > low_10d + 1.5 * atr_val:
+                                    reject = "overextended"
+                                else:
+                                    entry   = round(price, 2)
+                                    sl      = round(entry - ATR_STOP_MULT * atr_val, 2)
+                                    target  = round(entry + ATR_TARGET_MULT * atr_val, 2)
+                                    # Quality filter 4: minimum R:R viability
+                                    if (target - entry) < (entry - sl) * 1.4:
+                                        reject = "poor_rr"
+                                    else:
+                                        score   = round(
+                                            (wrsi_val - 57) * 0.6 +
+                                            (drsi_val - 57) * 0.6 +
+                                            min(20, (mcap / 100_000) * 5) +
+                                            (1.0 if drsi_val > rsi_prev else -1.0), 1  # bonus for rising RSI
+                                        )
                             con.execute("""
                                 INSERT OR REPLACE INTO screener_cache
                                 (sym,price,daily_rsi,weekly_rsi,atr,score,
@@ -400,6 +426,68 @@ def manage_positions(con):
                      f"unreal:Rs.{unreal:+.0f}  sl:Rs.{t['sl']:.2f}  day:{days}")
 
 # ── TWO-PASS SCAN ─────────────────────────────────────────────────────────────
+def quick_replace(con, slots_needed):
+    """
+    Fast slot replacement using screener cache.
+    Ranks all cached valid setups by score and places orders immediately.
+    No yfinance calls — runs in milliseconds.
+    Returns number of slots filled.
+    """
+    cache_cutoff = (datetime.now() - timedelta(hours=6)).isoformat()
+    # Get best cached setups not already in portfolio
+    rows = con.execute("""
+        SELECT sym, score, entry, sl, target, daily_rsi, weekly_rsi
+        FROM screener_cache
+        WHERE entry IS NOT NULL
+          AND updated_at > ?
+          AND daily_rsi  BETWEEN ? AND ?
+          AND weekly_rsi BETWEEN ? AND ?
+          AND sym NOT IN (SELECT sym FROM trades WHERE status='open')
+        ORDER BY score DESC
+        LIMIT ?
+    """, (cache_cutoff, DAILY_RSI_MIN, DAILY_RSI_MAX,
+          WEEKLY_RSI_MIN, WEEKLY_RSI_MAX, slots_needed * 3)).fetchall()
+
+    if not rows:
+        log.info("  Quick replace: no valid cache entries — doing full scan")
+        return 0
+
+    ws        = (date.today() - timedelta(days=date.today().weekday())).isoformat()
+    con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
+    stats_row = con.execute("SELECT risk_used FROM weekly_stats WHERE week_start=?", (ws,)).fetchone()
+    risk_used = float(stats_row[0]) if stats_row else 0.0
+    risk_left = MAX_WEEKLY_RISK - risk_used
+
+    placed = 0
+    for sym, score, entry, sl, target, drsi, wrsi in rows:
+        cur_open = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
+        if cur_open >= MAX_OPEN or placed >= slots_needed or risk_left <= 0:
+            break
+        if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'", (sym,)).fetchone():
+            continue
+        rp = abs(entry - sl)
+        if rp <= 0:
+            continue
+        qty         = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
+        actual_risk = round(qty * rp, 2)
+        rr          = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)
+        con.execute("""
+            INSERT INTO trades
+            (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
+             status,pnl,days_held,opened_at,exit_reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',0,0,?,?)
+        """, (f"{sym}_{int(time.time())}", sym, "BUY",
+              entry, sl, target, qty, actual_risk,
+              round(qty * abs(entry - target), 2),
+              rr, score, datetime.now().isoformat(), ""))
+        con.commit()
+        risk_left -= actual_risk
+        placed    += 1
+        log.info(f"  INSTANT BUY {sym}  qty:{qty}  @ Rs.{entry}"
+                 f"  SL:Rs.{sl}  TGT:Rs.{target}  wRSI:{wrsi}  dRSI:{drsi}  score:{score}")
+    return placed
+
+
 def scan_and_trade(universe, con):
     cache_cutoff  = (datetime.now() - timedelta(hours=4)).isoformat()
     all_setups    = []
@@ -633,8 +721,9 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 .sc.hi{color:var(--green);background:var(--gbg);border-color:var(--gbr)}
 
 /* ── METRICS ─────────────────────────────────────────────── */
-.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:1px;background:var(--b1);border-bottom:1px solid var(--b1)}
-@media(max-width:700px){.metrics{grid-template-columns:1fr 1fr}}
+.metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--b1);border-bottom:1px solid var(--b1)}
+@media(max-width:700px){.metrics{grid-template-columns:1fr 1fr 1fr}}
+@media(max-width:420px){.metrics{grid-template-columns:1fr 1fr}}
 .met{background:var(--s1);padding:14px 18px}
 .met-lbl{font-size:10px;color:var(--t4);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px}
 .met-val{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--white);line-height:1}
@@ -680,6 +769,17 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 .pc-prog-track{height:5px;background:var(--s2);border-radius:3px;position:relative;overflow:hidden}
 .pc-prog-fill{height:100%;border-radius:3px;transition:width .5s}
 .pc-prog-entry{position:absolute;top:0;width:2px;height:100%;background:var(--amber);opacity:.9}
+/* close button */
+.close-btn{
+  display:block;width:100%;padding:8px;
+  background:none;border:none;border-top:1px solid var(--b1);
+  color:var(--t4);font-family:var(--mono);font-size:10px;
+  cursor:pointer;transition:all .15s;letter-spacing:1px;
+  text-transform:uppercase;
+}
+.close-btn:hover{background:var(--rbg);color:var(--red);border-top-color:var(--rbr)}
+.close-btn:active{background:var(--red);color:#fff}
+.closing{opacity:.5;pointer-events:none}
 
 /* ── RISK BAR ────────────────────────────────────────────── */
 .risk-section{padding:10px 16px 12px;border-top:1px solid var(--b1)}
@@ -771,12 +871,22 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <div class="met">
     <div class="met-lbl">Portfolio</div>
     <div class="met-val" id="m-port">—</div>
-    <div class="met-sub" id="m-port-s">base Rs.1,00,000</div>
+    <div class="met-sub" id="m-port-s">principal + P&amp;L</div>
+  </div>
+  <div class="met" style="border-left:2px solid var(--green);padding-left:16px">
+    <div class="met-lbl">Total P&amp;L</div>
+    <div class="met-val g" id="m-pnl">—</div>
+    <div class="met-sub">realised + unrealised</div>
   </div>
   <div class="met">
-    <div class="met-lbl">Week P&amp;L</div>
-    <div class="met-val g" id="m-pnl">—</div>
-    <div class="met-sub"   id="m-pnl-s">—</div>
+    <div class="met-lbl">Realised P&amp;L</div>
+    <div class="met-val" id="m-real">Rs.0</div>
+    <div class="met-sub" id="m-real-s">closed trades only</div>
+  </div>
+  <div class="met">
+    <div class="met-lbl">Unrealised P&amp;L</div>
+    <div class="met-val" id="m-unreal">Rs.0</div>
+    <div class="met-sub" id="m-unreal-s">open positions</div>
   </div>
   <div class="met">
     <div class="met-lbl">Win Rate</div>
@@ -784,14 +894,9 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
     <div class="met-sub"   id="m-wr-s">0W / 0L</div>
   </div>
   <div class="met">
-    <div class="met-lbl">Risk Used</div>
-    <div class="met-val a" id="m-risk">0%</div>
+    <div class="met-lbl">Open / Risk</div>
+    <div class="met-val a" id="m-open">—</div>
     <div class="met-sub"   id="m-risk-s">Rs.0 / Rs.3,000</div>
-  </div>
-  <div class="met">
-    <div class="met-lbl">Open</div>
-    <div class="met-val"   id="m-open">—</div>
-    <div class="met-sub">max 5 · top 5/scan</div>
   </div>
 </div>
 
@@ -907,6 +1012,29 @@ function lc(l){
 }
 
 // ── Data refresh ─────────────────────────────────────────────────────────────
+async function manualClose(sym, btn) {
+  if (!confirm(`Close ${sym} at current market price?\n\nThis cannot be undone.`)) return;
+  btn.textContent = '⟳  Closing...';
+  btn.classList.add('closing');
+  try {
+    const r = await fetch(`/api/close/${sym}`, {method:'POST'});
+    const d = await r.json();
+    if (d.error) {
+      alert('Error: ' + d.error);
+      btn.textContent = `✕  Close ${sym} manually`;
+      btn.classList.remove('closing');
+    } else {
+      const sign = d.pnl >= 0 ? '+' : '';
+      btn.textContent = `✓  Closed at Rs.${d.price}  P&L ${sign}Rs.${d.pnl}`;
+      setTimeout(refresh, 800);
+    }
+  } catch(e) {
+    alert('Network error — try again');
+    btn.textContent = `✕  Close ${sym} manually`;
+    btn.classList.remove('closing');
+  }
+}
+
 async function refresh(){
   let d;
   try{
@@ -930,21 +1058,33 @@ async function refresh(){
     `realised ${realised>=0?'+':''}Rs.${Math.round(realised).toLocaleString('en-IN')} · unreal ${unreal>=0?'+':''}Rs.${Math.abs(Math.round(unreal)).toLocaleString('en-IN')}`;
 
   const tp=realised+unreal;
+
+  // Total P&L
   const pnlEl=document.getElementById('m-pnl');
   pnlEl.textContent=(tp>=0?'+Rs.':'-Rs.')+Math.abs(Math.round(tp)).toLocaleString('en-IN');
   pnlEl.className='met-val '+(tp>=0?'g':'r');
-  document.getElementById('m-pnl-s').textContent=
-    `realised Rs.${Math.round(realised).toLocaleString('en-IN')} · unreal ${unreal>=0?'+':''}Rs.${Math.abs(Math.round(unreal)).toLocaleString('en-IN')}`;
+
+  // Realised P&L (closed strategy trades only)
+  const realEl=document.getElementById('m-real');
+  realEl.textContent=(realised>=0?'Rs.':'-Rs.')+Math.abs(Math.round(realised)).toLocaleString('en-IN');
+  realEl.className='met-val '+(realised>0?'g':realised<0?'r':'');
+  document.getElementById('m-real-s').textContent=
+    realised===0?'no exits yet':`${s.wins||0}W / ${s.losses||0}L`;
+
+  // Unrealised P&L (open positions mark-to-market)
+  const unrEl=document.getElementById('m-unreal');
+  unrEl.textContent=(unreal>=0?'+Rs.':'-Rs.')+Math.abs(Math.round(unreal)).toLocaleString('en-IN');
+  unrEl.className='met-val '+(unreal>0?'g':unreal<0?'r':'');
+  document.getElementById('m-unreal-s').textContent=
+    open.length?`across ${open.length} position${open.length>1?'s':''}`:'no open positions';
 
   const tot=(s.wins||0)+(s.losses||0);
   document.getElementById('m-wr').textContent=tot?Math.round(s.wins/tot*100)+'%':'—';
   document.getElementById('m-wr-s').textContent=`${s.wins||0}W / ${s.losses||0}L`;
 
   const rp=Math.round((s.risk_used||0)/3000*100);
-  const rEl=document.getElementById('m-risk');
-  rEl.textContent=rp+'%';rEl.className='met-val '+(rp>80?'r':rp>50?'a':'a');
+  document.getElementById('m-open').textContent=`${open.length}/5`;
   document.getElementById('m-risk-s').textContent=`Rs.${s.risk_used||0} / Rs.3,000`;
-  document.getElementById('m-open').textContent=open.length;
 
   // Risk bar
   const rf=document.getElementById('risk-fill');
@@ -1011,6 +1151,9 @@ async function refresh(){
             <div class="pc-prog-entry" style="left:${ePct.toFixed(1)}%"></div>
           </div>
         </div>
+        <button class="close-btn" onclick="manualClose('${t.sym}', this)">
+          ✕ &nbsp;Close ${t.sym} manually
+        </button>
       </div>`;
     }).join('');
   }
@@ -1076,6 +1219,49 @@ def start_dashboard():
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)})
+
+    @app.route("/api/close/<sym>", methods=["POST"])
+    def manual_close(sym):
+        """Manually close an open position at current market price."""
+        try:
+            con2 = sqlite3.connect(DB_PATH)
+            row = con2.execute(
+                "SELECT id, entry, qty FROM trades WHERE sym=? AND status='open'",
+                (sym.upper(),)
+            ).fetchone()
+            if not row:
+                con2.close()
+                return jsonify({"error": f"{sym} not found in open positions"}), 404
+            tid, entry, qty = row
+            # Fetch current price
+            price = entry  # fallback
+            try:
+                h = yf.Ticker(sym.upper() + ".NS").history(
+                    period="1d", interval="1m", timeout=5, auto_adjust=True)
+                if h is not None and len(h) > 0:
+                    price = round(float(h["Close"].iloc[-1]), 2)
+            except Exception:
+                pass
+            qty   = qty or 1
+            pnl   = round((price - entry) * qty, 2)
+            status = "win" if pnl > 0 else "loss"
+            con2.execute(
+                "UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=? WHERE id=?",
+                (status, pnl, datetime.now().isoformat(), "MANUAL_CLOSE", tid)
+            )
+            # Update weekly stats
+            ws2 = (date.today()-timedelta(days=date.today().weekday())).isoformat()
+            con2.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)",(ws2,))
+            con2.execute(
+                "UPDATE weekly_stats SET pnl=pnl+?,wins=wins+?,losses=losses+? WHERE week_start=?",
+                (pnl, 1 if pnl>0 else 0, 0 if pnl>0 else 1, ws2)
+            )
+            con2.commit()
+            con2.close()
+            log.info(f"  MANUAL CLOSE {sym.upper()} @ Rs.{price:.2f}  P&L Rs.{pnl:+.2f}")
+            return jsonify({"sym": sym.upper(), "price": price, "pnl": pnl, "status": status})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
     @app.route("/api/status")
@@ -1329,8 +1515,15 @@ def run():
         else:
             slots = MAX_OPEN - open_cnt
             log.info(f"-- Market scan ({slots} slot{'s' if slots > 1 else ''} open)")
-            universe = fetch_universe()
-            scan_and_trade(universe, con)
+            # INSTANT REPLACEMENT: try screener cache first (no yfinance calls)
+            # This fills a newly-opened slot in seconds, not 8 minutes
+            filled = quick_replace(con, slots)
+            if filled < slots:
+                # Cache didn't have enough — do full universe scan for remaining slots
+                universe = fetch_universe()
+                scan_and_trade(universe, con)
+            else:
+                log.info(f"  Instant replacement: filled {filled} slot(s) from cache")
 
         # Summary
         stats    = get_stats(con)
