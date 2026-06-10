@@ -514,7 +514,8 @@ def get_stats(con):
     week_start_dt = ws + "T00:00:00"
     pnl_row = con.execute(
         "SELECT COALESCE(SUM(pnl),0) FROM trades "
-        "WHERE status IN ('win','loss','cancelled') "
+        "WHERE status IN ('win','loss') "
+        "AND exit_reason NOT LIKE '%EXCESS%' "
         "AND closed_at >= ?", (week_start_dt,)
     ).fetchone()
     real_pnl = float(pnl_row[0]) if pnl_row and pnl_row[0] is not None else 0.0
@@ -1028,8 +1029,8 @@ def start_dashboard():
                 qty = qty or 1
                 pnl = pnl if pnl is not None else 0.0
 
-                # Recalculate P&L for cancelled trades
-                if exit_reason and "EXCESS" in exit_reason:
+                # Recalculate P&L for cancelled trades ONLY if not yet computed
+                if exit_reason and "EXCESS" in exit_reason and pnl == 0:
                     last_price = None
                     # Try screener cache
                     cr = con.execute(
