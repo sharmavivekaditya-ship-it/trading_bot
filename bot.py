@@ -731,8 +731,9 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 .met-sub{font-size:10px;color:var(--t4);margin-top:4px;line-height:1.5}
 
 /* ── BODY GRID ───────────────────────────────────────────── */
-.body{display:grid;grid-template-columns:1fr 360px;gap:1px;background:var(--b1)}
-@media(max-width:860px){.body{grid-template-columns:1fr}}
+.body{display:grid;grid-template-columns:1fr 340px 260px;gap:1px;background:var(--b1)}
+@media(max-width:1100px){.body{grid-template-columns:1fr 300px}}
+@media(max-width:700px){.body{grid-template-columns:1fr}}
 .col{background:var(--bg)}
 .col-head{
   position:sticky;top:48px;z-index:50;
@@ -781,6 +782,33 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 .close-btn:active{background:var(--red);color:#fff}
 .closing{opacity:.5;pointer-events:none}
 
+
+/* ── MARKET PANEL ────────────────────────────────────────────── */
+.mkt-panel{background:var(--bg)}
+.idx-wrap{padding:6px 8px;display:flex;flex-direction:column;gap:2px}
+.idx-card{
+  background:var(--s1);border:1px solid var(--b1);border-radius:6px;
+  padding:9px 12px;display:flex;justify-content:space-between;align-items:center;
+  transition:border-color .15s;
+}
+.idx-card:hover{border-color:var(--b2)}
+.idx-card.up  {border-left:3px solid var(--green)}
+.idx-card.down{border-left:3px solid var(--red)}
+.idx-card.flat{border-left:3px solid var(--t4)}
+.idx-name{font-size:11px;font-weight:600;color:var(--t1)}
+.idx-sub {font-size:10px;color:var(--t4);margin-top:1px}
+.idx-r   {text-align:right}
+.idx-val {font-family:var(--mono);font-size:12px;font-weight:600;color:var(--white)}
+.idx-chg {font-family:var(--mono);font-size:10px;margin-top:1px}
+.idx-chg.up  {color:var(--green)}
+.idx-chg.down{color:var(--red)}
+.idx-chg.flat{color:var(--t4)}
+.idx-loading{text-align:center;padding:20px;font-size:11px;color:var(--t4);font-family:var(--mono)}
+.idx-divider{height:1px;background:var(--b1);margin:4px 8px}
+.idx-section-lbl{
+  font-size:9px;letter-spacing:1.5px;text-transform:uppercase;
+  color:var(--t4);padding:6px 12px 2px;font-family:var(--mono);
+}
 /* ── RISK BAR ────────────────────────────────────────────── */
 .risk-section{padding:10px 16px 12px;border-top:1px solid var(--b1)}
 .risk-lbl{display:flex;justify-content:space-between;font-size:11px;color:var(--t3);margin-bottom:5px}
@@ -929,6 +957,18 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
     </div>
     <div class="cl-wrap" id="cl-list">
       <div class="empty">○<br>No closed trades yet</div>
+    </div>
+  </div>
+
+
+  <!-- MARKET PANEL -->
+  <div class="col mkt-panel">
+    <div class="col-head">
+      <span class="col-title">Market</span>
+      <span style="font-size:10px;color:var(--t4)" id="mkt-updated">—</span>
+    </div>
+    <div id="mkt-indices">
+      <div class="idx-loading">Loading market data...</div>
     </div>
   </div>
 
@@ -1180,6 +1220,57 @@ async function refresh(){
     }).join('');
   }
 
+  // Market indices panel
+  const idxEl  = document.getElementById('mkt-indices');
+  const updEl  = document.getElementById('mkt-updated');
+  const indices = d.indices || [];
+  if (indices.length === 0) {
+    idxEl.innerHTML = '<div class="idx-loading">Market data unavailable</div>';
+  } else {
+    updEl.textContent = d.time || '—';
+    // Separate VIX from main indices
+    const main  = indices.filter(i => i.sym !== '^INDIAVIX');
+    const vix   = indices.find(i => i.sym === '^INDIAVIX');
+
+    let html = '<div class="idx-section-lbl">Indices &amp; Sectors</div>';
+    html += '<div class="idx-wrap">';
+    main.forEach(idx => {
+      const cls = idx.up ? 'up' : idx.down ? 'down' : 'flat';
+      const sign = idx.chg >= 0 ? '+' : '';
+      html += `<div class="idx-card ${cls}">
+        <div>
+          <div class="idx-name">${idx.name}</div>
+          <div class="idx-sub">${idx.sector}</div>
+        </div>
+        <div class="idx-r">
+          <div class="idx-val">${idx.price.toLocaleString('en-IN')}</div>
+          <div class="idx-chg ${cls}">${sign}${idx.chg}%</div>
+        </div>
+      </div>`;
+    });
+    html += '</div>';
+
+    if (vix) {
+      const vixCls = vix.price > 20 ? 'down' : vix.price < 14 ? 'up' : 'flat';
+      const vixLabel = vix.price > 20 ? 'High fear' : vix.price < 14 ? 'Low fear' : 'Neutral';
+      html += '<div class="idx-divider"></div>';
+      html += '<div class="idx-section-lbl">Volatility</div>';
+      html += '<div class="idx-wrap">';
+      html += `<div class="idx-card ${vixCls}">
+        <div>
+          <div class="idx-name">INDIA VIX</div>
+          <div class="idx-sub">${vixLabel}</div>
+        </div>
+        <div class="idx-r">
+          <div class="idx-val">${vix.price.toLocaleString('en-IN')}</div>
+          <div class="idx-chg ${vixCls}">${vix.chg >= 0 ? '+' : ''}${vix.chg}%</div>
+        </div>
+      </div>`;
+      html += '</div>';
+    }
+    idxEl.innerHTML = html;
+  }
+
   // Log
   const lb=document.getElementById('log-body');
   lb.innerHTML=logs.length?logs.map(l=>`<div class="${lc(l)}">${l}</div>`).join(''):'<span class="ld">No log entries yet</span>';
@@ -1398,12 +1489,52 @@ def start_dashboard():
             except Exception:
                 logs = ["Bot starting up..."]
 
+            # Fetch market indices (only during/near market hours to save calls)
+            indices = []
+            try:
+                INDICES = [
+                    ("^NSEI",   "NIFTY 50",       "Benchmark"),
+                    ("^NSEBANK","BANK NIFTY",      "Banking"),
+                    ("^CNXIT",  "NIFTY IT",        "Technology"),
+                    ("^CNXPHARMA","NIFTY PHARMA",  "Pharma"),
+                    ("^CNXAUTO","NIFTY AUTO",      "Auto"),
+                    ("^CNXFMCG","NIFTY FMCG",      "FMCG"),
+                    ("^CNXMETAL","NIFTY METAL",    "Metal"),
+                    ("^CNXREALTY","NIFTY REALTY",  "Realty"),
+                    ("^CNXMID",  "NIFTY MIDCAP",   "Mid Cap"),
+                    ("^INDIAVIX","INDIA VIX",       "Volatility"),
+                ]
+                import yfinance as _yfi
+                tickers = _yfi.download(
+                    " ".join(t for t,_,_ in INDICES),
+                    period="2d", interval="1d",
+                    progress=False, timeout=8, auto_adjust=True
+                )
+                for sym, name, sector in INDICES:
+                    try:
+                        closes = tickers["Close"][sym].dropna()
+                        if len(closes) >= 2:
+                            prev, curr = float(closes.iloc[-2]), float(closes.iloc[-1])
+                            chg_pct    = round((curr - prev) / prev * 100, 2)
+                            indices.append({
+                                "sym": sym, "name": name, "sector": sector,
+                                "price": round(curr, 2),
+                                "chg": chg_pct,
+                                "up": chg_pct > 0.1,
+                                "down": chg_pct < -0.1,
+                            })
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
             return jsonify({
-                "stats":  stats,
-                "open":   open_list,
-                "closed": closed_list,
-                "logs":   logs,
-                "time":   datetime.now().strftime("%H:%M:%S"),
+                "stats":   stats,
+                "open":    open_list,
+                "closed":  closed_list,
+                "logs":    logs,
+                "indices": indices,
+                "time":    datetime.now().strftime("%H:%M:%S"),
             })
 
         except Exception as e:
