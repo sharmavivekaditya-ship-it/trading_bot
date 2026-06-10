@@ -512,18 +512,26 @@ def get_stats(con):
     ).fetchone()
     # Compute P&L directly from closed trades this week — ground truth
     week_start_dt = ws + "T00:00:00"
+    # Only count genuine strategy exits — not cancellations or excess removals
     pnl_row = con.execute(
         "SELECT COALESCE(SUM(pnl),0) FROM trades "
         "WHERE status IN ('win','loss') "
-        "AND exit_reason NOT LIKE '%EXCESS%' "
+        "AND (exit_reason NOT LIKE '%EXCESS%' AND exit_reason NOT LIKE '%CANCEL%') "
         "AND closed_at >= ?", (week_start_dt,)
     ).fetchone()
     real_pnl = float(pnl_row[0]) if pnl_row and pnl_row[0] is not None else 0.0
+    # Also compute cancelled P&L separately for transparency
+    cancelled_row = con.execute(
+        "SELECT COALESCE(SUM(pnl),0) FROM trades "
+        "WHERE exit_reason LIKE '%EXCESS%' OR exit_reason LIKE '%CANCEL%'"
+    ).fetchone()
+    cancelled_pnl = float(cancelled_row[0]) if cancelled_row and cancelled_row[0] else 0.0
     return {
-        "pnl":       real_pnl,
-        "risk_used": float(r[0] or 0),
-        "wins":      int(r[1] or 0),
-        "losses":    int(r[2] or 0),
+        "pnl":           real_pnl,
+        "risk_used":     float(r[0] or 0),
+        "wins":          int(r[1] or 0),
+        "losses":        int(r[2] or 0),
+        "cancelled_pnl": cancelled_pnl,
     }
 
 # ── DASHBOARD ─────────────────────────────────────────────────────────────────
@@ -823,7 +831,7 @@ async function refresh() {
   const unreal = open.reduce((sum, t) => sum + (t.unrealised || 0), 0);
 
   // Metrics
-  const portVal = CAP + (s.pnl || 0) + unreal;
+  const portVal = CAP + unreal;  // base + unrealised from open positions only
   document.getElementById('m-port').textContent   = 'Rs.' + Math.round(portVal).toLocaleString('en-IN');
   document.getElementById('m-port-s').textContent = 'base Rs.1,00,000 · unreal ' +
     (unreal >= 0 ? '+' : '') + 'Rs.' + Math.abs(Math.round(unreal)).toLocaleString('en-IN');
@@ -833,7 +841,7 @@ async function refresh() {
   pnlEl.textContent  = (totalPnl >= 0 ? '+Rs.' : '-Rs.') + Math.abs(Math.round(totalPnl)).toLocaleString('en-IN');
   pnlEl.className    = 'mv ' + (totalPnl >= 0 ? 'g' : 'r');
   document.getElementById('m-pnl-s').textContent =
-    'closed ' + (s.pnl >= 0 ? '+' : '') + 'Rs.' + Math.round(s.pnl || 0).toLocaleString('en-IN') +
+    'strategy realised Rs.' + Math.round(s.pnl || 0).toLocaleString('en-IN') +
     ' · unreal ' + (unreal >= 0 ? '+' : '') + 'Rs.' + Math.abs(Math.round(unreal)).toLocaleString('en-IN');
 
   const tot = (s.wins || 0) + (s.losses || 0);
