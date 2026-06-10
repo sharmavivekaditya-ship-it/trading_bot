@@ -512,18 +512,27 @@ def get_stats(con):
     ).fetchone()
     # Compute P&L directly from closed trades this week — ground truth
     week_start_dt = ws + "T00:00:00"
-    # Only count genuine strategy exits — not cancellations or excess removals
+    # Only count trades closed by actual strategy signals
+    # Real exits have exit_reason like: HARD_STOP, DAILY_RSI(...), WEEKLY_RSI(...), DIVERGENCE
+    # Cancelled/excess trades have: EXCESS_CANCELLED, EXCESS_ON_BOOT, CANCELLED
+    # Safest: only include trades where exit_reason starts with a known signal keyword
     pnl_row = con.execute(
         "SELECT COALESCE(SUM(pnl),0) FROM trades "
         "WHERE status IN ('win','loss') "
-        "AND (exit_reason NOT LIKE '%EXCESS%' AND exit_reason NOT LIKE '%CANCEL%') "
+        "AND exit_reason IS NOT NULL "
+        "AND exit_reason != '' "
+        "AND exit_reason NOT LIKE '%EXCESS%' "
+        "AND exit_reason NOT LIKE '%CANCEL%' "
+        "AND exit_reason NOT LIKE '%BOOT%' "
         "AND closed_at >= ?", (week_start_dt,)
     ).fetchone()
     real_pnl = float(pnl_row[0]) if pnl_row and pnl_row[0] is not None else 0.0
     # Also compute cancelled P&L separately for transparency
     cancelled_row = con.execute(
         "SELECT COALESCE(SUM(pnl),0) FROM trades "
-        "WHERE exit_reason LIKE '%EXCESS%' OR exit_reason LIKE '%CANCEL%'"
+        "WHERE exit_reason LIKE '%EXCESS%' "
+        "OR exit_reason LIKE '%CANCEL%' "
+        "OR exit_reason LIKE '%BOOT%'"
     ).fetchone()
     cancelled_pnl = float(cancelled_row[0]) if cancelled_row and cancelled_row[0] else 0.0
     return {
@@ -831,11 +840,11 @@ async function refresh() {
   const unreal = open.reduce((sum, t) => sum + (t.unrealised || 0), 0);
 
   // Metrics
-  const portVal = CAP + unreal;  // base + unrealised from open positions only
+  const portVal = CAP + (s.pnl || 0) + unreal;  // principal + realised P&L + unrealised P&L
   document.getElementById('m-port').textContent   = 'Rs.' + Math.round(portVal).toLocaleString('en-IN');
-  document.getElementById('m-port-s').textContent = 'base Rs.1,00,000 · unreal ' +
-    (unreal >= 0 ? '+' : '') + 'Rs.' + Math.abs(Math.round(unreal)).toLocaleString('en-IN');
-
+  document.getElementById('m-port-s').textContent = 'principal Rs.1,00,000 · realised ' +
+    (s.pnl >= 0 ? '+' : '') + 'Rs.' + Math.round(s.pnl || 0).toLocaleString('en-IN') +
+    ' · unreal ' + (unreal >= 0 ? '+' : '') + 'Rs.' + Math.abs(Math.round(unreal)).toLocaleString('en-IN');
   const pnlEl = document.getElementById('m-pnl');
   const totalPnl = (s.pnl || 0) + unreal;
   pnlEl.textContent  = (totalPnl >= 0 ? '+Rs.' : '-Rs.') + Math.abs(Math.round(totalPnl)).toLocaleString('en-IN');
@@ -963,6 +972,22 @@ def start_dashboard():
     @app.route("/ping")
     def ping():
         return "pong", 200
+
+    @app.route("/debug/trades")
+    def debug_trades():
+        """Show all closed trades with their exit_reason and pnl — for debugging."""
+        try:
+            con2 = sqlite3.connect(DB_PATH)
+            rows = con2.execute(
+                "SELECT sym, status, pnl, exit_reason FROM trades "
+                "WHERE status != 'open' ORDER BY closed_at DESC"
+            ).fetchall()
+            con2.close()
+            result = [{"sym":r[0],"status":r[1],"pnl":r[2],"exit_reason":r[3]} for r in rows]
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)})
+
 
     @app.route("/api/status")
     def api_status():
