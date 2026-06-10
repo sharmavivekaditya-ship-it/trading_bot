@@ -817,6 +817,17 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 
 /* ── CLOSED LIST ─────────────────────────────────────────── */
 .cl-wrap{padding:8px;display:flex;flex-direction:column;gap:4px;max-height:calc(100vh - 240px);overflow-y:auto}
+/* collapsible closed trades */
+.cl-col{background:var(--bg);transition:all .2s}
+.cl-col.collapsed .cl-wrap{display:none}
+.cl-col.collapsed .col-head{border-bottom:none}
+.cl-toggle{
+  background:none;border:none;cursor:pointer;
+  color:var(--t3);font-size:13px;padding:2px 4px;
+  border-radius:4px;transition:all .15s;line-height:1;
+}
+.cl-toggle:hover{background:var(--b1);color:var(--t1)}
+.cl-col.collapsed .cl-toggle{transform:rotate(180deg)}
 .cl-wrap::-webkit-scrollbar{width:3px}.cl-wrap::-webkit-scrollbar-thumb{background:var(--b2);border-radius:2px}
 .cl-card{
   background:var(--s1);border:1px solid var(--b1);border-radius:6px;
@@ -950,9 +961,12 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   </div>
 
   <!-- CLOSED TRADES -->
-  <div class="col">
-    <div class="col-head">
-      <span class="col-title">Closed Trades</span>
+  <div class="col cl-col collapsed" id="cl-col">
+    <div class="col-head" onclick="toggleClosed()" style="cursor:pointer;user-select:none">
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="cl-toggle" id="cl-toggle" title="Expand/collapse">⌃</button>
+        <span class="col-title">Closed Trades</span>
+      </div>
       <span class="col-badge cb-closed" id="cl-badge">0</span>
     </div>
     <div class="cl-wrap" id="cl-list">
@@ -1052,6 +1066,21 @@ function lc(l){
 }
 
 // ── Data refresh ─────────────────────────────────────────────────────────────
+function toggleClosed() {
+  const col = document.getElementById('cl-col');
+  col.classList.toggle('collapsed');
+  // Persist preference
+  localStorage.setItem('cl_collapsed', col.classList.contains('collapsed') ? '1' : '0');
+}
+
+// Restore preference on load
+(function(){
+  const pref = localStorage.getItem('cl_collapsed');
+  const col  = document.getElementById('cl-col');
+  if (pref === '0') col.classList.remove('collapsed');
+  // If there are closed trades, auto-expand
+})();
+
 async function manualClose(sym, btn) {
   if (!confirm(`Close ${sym} at current market price?\n\nThis cannot be undone.`)) return;
   btn.textContent = '⟳  Closing...';
@@ -1201,6 +1230,11 @@ async function refresh(){
   // Closed trades
   const cl=document.getElementById('cl-list');
   document.getElementById('cl-badge').textContent=closed.length;
+  // Auto-expand if there are real strategy exits (not just CANCELLED)
+  const realExits = closed.filter(t => t.exit_reason && !t.exit_reason.includes('EXCESS') && !t.exit_reason.includes('CANCEL'));
+  if (realExits.length > 0) {
+    document.getElementById('cl-col').classList.remove('collapsed');
+  }
   if(!closed.length){
     cl.innerHTML='<div class="empty">○<br>No closed trades yet</div>';
   }else{
