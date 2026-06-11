@@ -1523,39 +1523,40 @@ def start_dashboard():
             except Exception:
                 logs = ["Bot starting up..."]
 
-            # Fetch market indices (only during/near market hours to save calls)
+            # Fetch market indices using curl_cffi (bypasses Yahoo 403 on cloud)
             indices = []
             try:
-                INDICES = [
-                    ("^NSEI",   "NIFTY 50",       "Benchmark"),
-                    ("^NSEBANK","BANK NIFTY",      "Banking"),
-                    ("^CNXIT",  "NIFTY IT",        "Technology"),
-                    ("^CNXPHARMA","NIFTY PHARMA",  "Pharma"),
-                    ("^CNXAUTO","NIFTY AUTO",      "Auto"),
-                    ("^CNXFMCG","NIFTY FMCG",      "FMCG"),
-                    ("^CNXMETAL","NIFTY METAL",    "Metal"),
-                    ("^CNXREALTY","NIFTY REALTY",  "Realty"),
-                    ("^CNXMID",  "NIFTY MIDCAP",   "Mid Cap"),
-                    ("^INDIAVIX","INDIA VIX",       "Volatility"),
-                ]
                 import yfinance as _yfi
-                tickers = _yfi.download(
-                    " ".join(t for t,_,_ in INDICES),
-                    period="2d", interval="1d",
-                    progress=False, timeout=8, auto_adjust=True
-                )
+                from curl_cffi.requests import Session as CSession
+                _session = CSession(impersonate="chrome110")
+                _yfi.set_tz_cache_location("/tmp/yf_tz")
+
+                INDICES = [
+                    ("^NSEI",       "NIFTY 50",      "Benchmark"),
+                    ("^NSEBANK",    "BANK NIFTY",     "Banking"),
+                    ("^CNXIT",      "NIFTY IT",       "Technology"),
+                    ("^CNXPHARMA",  "NIFTY PHARMA",   "Pharma"),
+                    ("^CNXAUTO",    "NIFTY AUTO",      "Auto"),
+                    ("^CNXFMCG",    "NIFTY FMCG",      "FMCG"),
+                    ("^CNXMETAL",   "NIFTY METAL",     "Metal"),
+                    ("^CNXREALTY",  "NIFTY REALTY",    "Realty"),
+                    ("^NSMIDCP100", "NIFTY MIDCAP 100","Mid Cap"),
+                    ("^INDIAVIX",   "INDIA VIX",       "Volatility"),
+                ]
                 for sym, name, sector in INDICES:
                     try:
-                        closes = tickers["Close"][sym].dropna()
-                        if len(closes) >= 2:
-                            prev, curr = float(closes.iloc[-2]), float(closes.iloc[-1])
-                            chg_pct    = round((curr - prev) / prev * 100, 2)
+                        t   = _yfi.Ticker(sym, session=_session)
+                        h   = t.history(period="5d", interval="1d",
+                                        auto_adjust=True, timeout=6)
+                        h   = h.dropna(subset=["Close"])
+                        if len(h) >= 2:
+                            prev  = float(h["Close"].iloc[-2])
+                            curr  = float(h["Close"].iloc[-1])
+                            chg   = round((curr - prev) / prev * 100, 2)
                             indices.append({
                                 "sym": sym, "name": name, "sector": sector,
-                                "price": round(curr, 2),
-                                "chg": chg_pct,
-                                "up": chg_pct > 0.1,
-                                "down": chg_pct < -0.1,
+                                "price": round(curr, 2), "chg": chg,
+                                "up": chg > 0.1, "down": chg < -0.1,
                             })
                     except Exception:
                         pass
