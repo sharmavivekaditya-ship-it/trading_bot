@@ -1219,18 +1219,18 @@ async function refresh(){
           </div>
           <div class="pc-pnl">
             <div class="pc-pnl-v ${uc}">${us}Rs.${Math.abs(u).toLocaleString('en-IN')}</div>
-            <div class="pc-pnl-p">${us}${t.unreal_pct||0}%</div>
+            <div class="pc-pnl-p">${us}${t.unreal_pct||0}% &nbsp;·&nbsp; ${t.qty||1} qty</div>
           </div>
         </div>
         <div class="pc-row">
           <div>
-            <div class="pc-item-lbl">Last price</div>
+            <div class="pc-item-lbl">Last · Qty</div>
             <div class="pc-item-val"><span class="v-white">Rs.${lp.toLocaleString('en-IN')}</span></div>
-          </div>
+            <div class="pc-item-val"><span class="v-white">Rs.${lp.toLocaleString('en-IN')}</span> <span style="color:var(--t4)">× ${t.qty||1}</span></div>
           <div>
-            <div class="pc-item-lbl">Entry</div>
+            <div class="pc-item-lbl">Entry · Position</div>
             <div class="pc-item-val"><span class="v-amber">Rs.${t.entry}</span></div>
-          </div>
+            <div class="pc-item-val"><span class="v-amber">Rs.${t.entry}</span> <span style="color:var(--t4)">(Rs.${Math.round(t.entry*(t.qty||1)).toLocaleString('en-IN')})</span></div>
           <div>
             <div class="pc-item-lbl">Stop loss</div>
             <div class="pc-item-val"><span class="v-red">Rs.${t.sl}</span></div>
@@ -1465,7 +1465,9 @@ def start_dashboard():
                         last_price = round(float(cr[0]), 2)
                 qty     = qty or 1
                 unreal  = round((last_price - entry) * qty, 2)
-                upct    = round((last_price - entry) / entry * 100, 2) if entry else 0
+                # % move on total position value (entry × qty), not just per share
+                position_value = entry * qty
+                upct    = round((last_price - entry) * qty / position_value * 100, 2) if position_value else 0
                 open_list.append({
                     "sym":        sym,
                     "entry":      entry,
