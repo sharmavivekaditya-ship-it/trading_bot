@@ -1523,45 +1523,52 @@ def start_dashboard():
             except Exception:
                 logs = ["Bot starting up..."]
 
-            # Fetch market indices using curl_cffi (bypasses Yahoo 403 on cloud)
+            # Fetch market indices — cached 60s so we don't hammer Yahoo every 5s
             indices = []
-            try:
-                import yfinance as _yfi
-                from curl_cffi.requests import Session as CSession
-                _session = CSession(impersonate="chrome110")
-                _yfi.set_tz_cache_location("/tmp/yf_tz")
-
+            _now_ts = time.time()
+            _cache  = getattr(api_status, '_idx_cache', {"ts": 0, "data": []})
+            if _now_ts - _cache["ts"] > 60:
+                import yfinance as _yfi2
+                import logging as _lg2
+                from curl_cffi.requests import Session as _CS
+                _lg2.getLogger("yfinance").setLevel(_lg2.CRITICAL)
+                _sess = _CS(impersonate="chrome110")
+                _yfi2.set_tz_cache_location("/tmp/yf_tz")
                 INDICES = [
-                    ("^NSEI",       "NIFTY 50",      "Benchmark"),
-                    ("^NSEBANK",    "BANK NIFTY",     "Banking"),
-                    ("^CNXIT",      "NIFTY IT",       "Technology"),
-                    ("^CNXPHARMA",  "NIFTY PHARMA",   "Pharma"),
-                    ("^CNXAUTO",    "NIFTY AUTO",      "Auto"),
-                    ("^CNXFMCG",    "NIFTY FMCG",      "FMCG"),
-                    ("^CNXMETAL",   "NIFTY METAL",     "Metal"),
-                    ("^CNXREALTY",  "NIFTY REALTY",    "Realty"),
-                    ("^NSMIDCP100", "NIFTY MIDCAP 100","Mid Cap"),
-                    ("^INDIAVIX",   "INDIA VIX",       "Volatility"),
+                    ("^NSEI",      "NIFTY 50",      "Benchmark"),
+                    ("^NSEBANK",   "BANK NIFTY",    "Banking"),
+                    ("^CNXIT",     "NIFTY IT",       "Technology"),
+                    ("^CNXPHARMA", "NIFTY PHARMA",  "Pharma"),
+                    ("^CNXAUTO",   "NIFTY AUTO",    "Auto"),
+                    ("^CNXFMCG",   "NIFTY FMCG",   "FMCG"),
+                    ("^CNXMETAL",  "NIFTY METAL",   "Metal"),
+                    ("^CNXREALTY", "NIFTY REALTY",  "Realty"),
+                    ("^CNXSC",     "NIFTY SMALLCAP","Small Cap"),
+                    ("^INDIAVIX",  "INDIA VIX",     "Volatility"),
                 ]
-                for sym, name, sector in INDICES:
+                _fresh = []
+                for _sym, _name, _sector in INDICES:
                     try:
-                        t   = _yfi.Ticker(sym, session=_session)
-                        h   = t.history(period="5d", interval="1d",
+                        _t = _yfi2.Ticker(_sym, session=_sess)
+                        _h = _t.history(period="5d", interval="1d",
                                         auto_adjust=True, timeout=6)
-                        h   = h.dropna(subset=["Close"])
-                        if len(h) >= 2:
-                            prev  = float(h["Close"].iloc[-2])
-                            curr  = float(h["Close"].iloc[-1])
-                            chg   = round((curr - prev) / prev * 100, 2)
-                            indices.append({
-                                "sym": sym, "name": name, "sector": sector,
-                                "price": round(curr, 2), "chg": chg,
-                                "up": chg > 0.1, "down": chg < -0.1,
+                        _h = _h.dropna(subset=["Close"])
+                        if len(_h) >= 2:
+                            _prev = float(_h["Close"].iloc[-2])
+                            _curr = float(_h["Close"].iloc[-1])
+                            _chg  = round((_curr - _prev) / _prev * 100, 2)
+                            _fresh.append({
+                                "sym": _sym, "name": _name, "sector": _sector,
+                                "price": round(_curr, 2), "chg": _chg,
+                                "up": _chg > 0.1, "down": _chg < -0.1,
                             })
                     except Exception:
                         pass
-            except Exception:
-                pass
+                _lg2.getLogger("yfinance").setLevel(_lg2.ERROR)
+                api_status._idx_cache = {"ts": _now_ts, "data": _fresh}
+                indices = _fresh
+            else:
+                indices = _cache["data"]
 
             return jsonify({
                 "stats":   stats,
