@@ -144,7 +144,7 @@ def init_db():
 
 # ── MARKET HOURS ─────────────────────────────────────────────────────────────
 def ist_now():
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+    return datetime.now(tz=__import__("datetime").timezone.utc).replace(tzinfo=None) + timedelta(hours=5, minutes=30)
 
 def is_market_open():
     t = ist_now()
@@ -257,9 +257,11 @@ def screen(sym, cache_cutoff, con):
             price   = float(c[-1])
             avg_vol = float(v[-20:].mean())
 
+            vol_r = float(v[-1]) / avg_vol if avg_vol > 0 else 0
             if   price < MIN_PRICE:     reject = f"price_low"
             elif price > MAX_PRICE:     reject = f"price_high"
             elif avg_vol < MIN_AVG_VOL: reject = f"low_vol"
+            elif vol_r < MIN_VOL_RATIO: reject = f"low_vol_today({vol_r:.1f}x)"
             else:
                 mcap = get_mcap(sym)
                 if mcap < MIN_MCAP_CR:
@@ -280,10 +282,20 @@ def screen(sym, cache_cutoff, con):
                         elif wrsi_val > WEEKLY_RSI_MAX:
                             reject = f"weekly_rsi_high({wrsi_val:.0f})"  # overbought weekly
                         else:
-                            # Quality filter 1: RSI must be rising (not falling into range)
-                            rsi_prev = float(d_rsi[-2]) if len(d_rsi) >= 2 else drsi_val
-                            if drsi_val < rsi_prev - 3:
-                                reject = f"rsi_falling({drsi_val:.0f}<{rsi_prev:.0f})"
+                            # Quality filter 1: RSI 3-day trend check
+                            # Not a hard "must be rising" — allows healthy consolidation
+                            # Rejects only if RSI is in a clear 3-day downtrend within zone
+                            # Compute RSI trend metrics — available throughout this block
+                            rsi_prev1    = float(d_rsi[-2]) if len(d_rsi) >= 2 else drsi_val
+                            rsi_prev2    = float(d_rsi[-3]) if len(d_rsi) >= 3 else rsi_prev1
+                            rsi_3d_trend = drsi_val - rsi_prev2  # +ve = rising, -ve = falling
+                            rsi_1d_drop  = rsi_prev1 - drsi_val  # how much fell today
+                            if rsi_1d_drop > 5:
+                                # Sharp 1-day drop — clear deterioration
+                                reject = f"rsi_sharp_drop({drsi_val:.0f},{rsi_1d_drop:.1f}pts)"
+                            elif rsi_3d_trend < -4:
+                                # Falling for 3 days — trend weakening
+                                reject = f"rsi_3d_falling({drsi_val:.0f},{rsi_3d_trend:.1f}pts)"
                             # Quality filter 2: price above 20-day EMA (uptrend only)
                             elif price < float(pd.Series(c).ewm(span=20, adjust=False).mean().iloc[-1]) * 0.98:
                                 reject = "below_ema20"
@@ -311,7 +323,9 @@ def screen(sym, cache_cutoff, con):
                                         d_quality = max(0.0, RSI_HALF - abs(drsi_val - RSI_MID)) / RSI_HALF  # 0→1
                                         rsi_score = (w_quality + d_quality) * 10.0  # max 20 pts
                                         mcap_score = min(15, (mcap / 100_000) * 4)   # max 15 pts
-                                        rsi_bonus  = 2.0 if drsi_val > rsi_prev else -1.0  # rising=+2, falling=-1
+                                        # Score bonus: 3-day RSI trend, not just 1-day
+                                        # rsi_3d_trend already defined above in same scope
+                                        rsi_bonus = 2.0 if rsi_3d_trend > 1 else (0.0 if rsi_3d_trend >= -1 else -1.0)
                                         score = round(rsi_score + mcap_score + rsi_bonus, 1)
                             con.execute("""
                                 INSERT OR REPLACE INTO screener_cache
@@ -439,7 +453,7 @@ def quick_replace(con, slots_needed):
     No yfinance calls — runs in milliseconds.
     Returns number of slots filled.
     """
-    cache_cutoff = (datetime.now() - timedelta(hours=6)).isoformat()
+    cache_cutoff = (datetime.now() - timedelta(hours=1)).isoformat()  # 1h: cache survives restart
     # Get best cached setups not already in portfolio
     rows = con.execute("""
         SELECT sym, score, entry, sl, target, daily_rsi, weekly_rsi
@@ -1693,6 +1707,12 @@ def run():
     while True:
         cycle += 1
         log.info(f"\n== Cycle #{cycle} — {datetime.now().strftime('%H:%M:%S %d-%b')} ==")
+
+        # Repair NULL qty from legacy trades before managing positions
+        fixed = con.execute("UPDATE trades SET qty=1 WHERE qty IS NULL AND status='open'").rowcount
+        con.commit()
+        if fixed:
+            log.info(f"  Repaired {fixed} NULL qty trades")
 
         # Manage open positions
         log.info("-- Position management")
