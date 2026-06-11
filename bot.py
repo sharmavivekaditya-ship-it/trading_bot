@@ -61,6 +61,7 @@ MIN_PRICE        = 50
 MAX_PRICE        = 50_000
 MIN_AVG_VOL      = 200_000
 MIN_VOL_RATIO    = 0.8         # today's volume must be at least 80% of 20d avg
+MIN_SCORE        = 5.0         # minimum composite score to qualify for trading
 MIN_MCAP_CR      = 20_000      # Rs. Crores
 
 # Strategy parameters
@@ -301,12 +302,17 @@ def screen(sym, cache_cutoff, con):
                                     if (target - entry) < (entry - sl) * 1.4:
                                         reject = "poor_rr"
                                     else:
-                                        score   = round(
-                                            (wrsi_val - 57) * 0.6 +
-                                            (drsi_val - 57) * 0.6 +
-                                            min(20, (mcap / 100_000) * 5) +
-                                            (1.0 if drsi_val > rsi_prev else -1.0), 1  # bonus for rising RSI
-                                        )
+                                        # Score rewards proximity to midpoint (62), not raw RSI height
+                                        # Peak score at RSI=62, falls off toward both edges (57 and 67)
+                                        # This means RSI 62 > RSI 66 — sweet spot, not ceiling chaser
+                                        RSI_MID = 62.0
+                                        RSI_HALF = 5.0  # half-range (57 to 67)
+                                        w_quality = max(0.0, RSI_HALF - abs(wrsi_val - RSI_MID)) / RSI_HALF  # 0→1
+                                        d_quality = max(0.0, RSI_HALF - abs(drsi_val - RSI_MID)) / RSI_HALF  # 0→1
+                                        rsi_score = (w_quality + d_quality) * 10.0  # max 20 pts
+                                        mcap_score = min(15, (mcap / 100_000) * 4)   # max 15 pts
+                                        rsi_bonus  = 2.0 if drsi_val > rsi_prev else -1.0  # rising=+2, falling=-1
+                                        score = round(rsi_score + mcap_score + rsi_bonus, 1)
                             con.execute("""
                                 INSERT OR REPLACE INTO screener_cache
                                 (sym,price,daily_rsi,weekly_rsi,atr,score,
@@ -403,7 +409,7 @@ def manage_positions(con):
             if bearish_divergence(t["sym"], DIV_LOOKBACK):
                 reason = "DIVERGENCE"
         if reason:
-            pnl    = round((price - t["entry"]) * t["qty"], 2)
+            pnl    = round((price - t["entry"]) * (t["qty"] or 1), 2)
             status = "win" if pnl > 0 else "loss"
             con.execute(
                 "UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=? WHERE id=?",
@@ -421,7 +427,7 @@ def manage_positions(con):
             con.commit()
             log.info(f"  CLOSED {t['sym']} [{reason}] @ Rs.{price:.2f}  P&L Rs.{pnl:+.2f}")
         else:
-            unreal = round((price - t["entry"]) * t["qty"], 0)
+            unreal = round((price - t["entry"]) * (t["qty"] or 1), 0)
             log.info(f"  HOLD {t['sym']} @ Rs.{price:.2f}  "
                      f"unreal:Rs.{unreal:+.0f}  sl:Rs.{t['sl']:.2f}  day:{days}")
 
@@ -521,8 +527,10 @@ def scan_and_trade(universe, con):
     for k, v in sorted(reject_counts.items(), key=lambda x: -x[1]):
         log.info(f"    {k:<35} {v:>5}")
 
+    # Filter by minimum score — don't trade weak setups
+    all_setups = [s for s in all_setups if s["score"] >= MIN_SCORE]
     if not all_setups:
-        log.info("  No setups found this cycle")
+        log.info(f"  No setups above MIN_SCORE={MIN_SCORE} — skipping cycle")
         return 0
 
     # ── PASS 2: rank and trade top N ─────────────────────────────────────────
@@ -558,6 +566,15 @@ def scan_and_trade(universe, con):
         if con.execute(
             "SELECT 1 FROM trades WHERE sym=? AND status='open'", (s["sym"],)
         ).fetchone():
+            continue
+        # Group concentration — max 1 stock per corporate group (blocks ADANI spam)
+        _pfx = ''.join(c for c in s["sym"] if c.isalpha())[:5]
+        _grp = con.execute(
+            "SELECT COUNT(*) FROM trades WHERE status='open' AND sym LIKE ?",
+            (_pfx[:4] + '%',)
+        ).fetchone()[0]
+        if _grp >= 1:
+            log.info(f"  SKIP {s['sym']} — group limit (1 per group, {_pfx[:4]}* already held)")
             continue
         rp  = abs(s["entry"] - s["sl"])
         if rp <= 0:
