@@ -748,8 +748,8 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 .met-sub{font-size:10px;color:var(--t4);margin-top:4px;line-height:1.5}
 
 /* ── BODY GRID ───────────────────────────────────────────── */
-.body{display:grid;grid-template-columns:1fr 340px 260px;gap:1px;background:var(--b1)}
-@media(max-width:1100px){.body{grid-template-columns:1fr 300px}}
+.body{display:grid;grid-template-columns:1fr 320px 240px;gap:1px;background:var(--b1)}
+@media(max-width:1100px){.body{grid-template-columns:1fr 280px}}
 @media(max-width:700px){.body{grid-template-columns:1fr}}
 .col{background:var(--bg)}
 .col-head{
@@ -802,7 +802,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 
 /* ── MARKET PANEL ────────────────────────────────────────────── */
 .mkt-panel{background:var(--bg)}
-.idx-wrap{padding:6px 8px;display:flex;flex-direction:column;gap:2px}
+.idx-wrap{padding:6px 8px;display:flex;flex-direction:column;gap:2px;overflow-y:auto}
 .idx-card{
   background:var(--s1);border:1px solid var(--b1);border-radius:6px;
   padding:9px 12px;display:flex;justify-content:space-between;align-items:center;
@@ -837,6 +837,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 /* collapsible closed trades */
 .cl-col{background:var(--bg);transition:all .2s}
 .cl-col.collapsed .cl-wrap{display:none}
+.cl-col.collapsed{min-width:0}
 .cl-col.collapsed .col-head{border-bottom:none}
 .cl-toggle{
   background:none;border:none;cursor:pointer;
@@ -977,6 +978,17 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
     </div>
   </div>
 
+  <!-- MARKET PANEL -->
+  <div class="col mkt-panel">
+    <div class="col-head">
+      <span class="col-title">Market</span>
+      <span style="font-size:10px;color:var(--t4)">60s · <span id="mkt-updated">—</span></span>
+    </div>
+    <div id="mkt-indices">
+      <div class="idx-loading">Loading market data...</div>
+    </div>
+  </div>
+
   <!-- CLOSED TRADES -->
   <div class="col cl-col collapsed" id="cl-col">
     <div class="col-head" onclick="toggleClosed()" style="cursor:pointer;user-select:none">
@@ -988,18 +1000,6 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
     </div>
     <div class="cl-wrap" id="cl-list">
       <div class="empty">○<br>No closed trades yet</div>
-    </div>
-  </div>
-
-
-  <!-- MARKET PANEL -->
-  <div class="col mkt-panel">
-    <div class="col-head">
-      <span class="col-title">Market</span>
-      <span style="font-size:10px;color:var(--t4)" id="mkt-updated">—</span>
-    </div>
-    <div id="mkt-indices">
-      <div class="idx-loading">Loading market data...</div>
     </div>
   </div>
 
@@ -1278,7 +1278,7 @@ async function refresh(){
   if (indices.length === 0) {
     idxEl.innerHTML = '<div class="idx-loading">Market data unavailable</div>';
   } else {
-    updEl.textContent = d.time || '—';
+    updEl.textContent = 'as of ' + (d.time || '—');
     // Separate VIX from main indices
     const main  = indices.filter(i => i.sym !== '^INDIAVIX');
     const vix   = indices.find(i => i.sym === '^INDIAVIX');
@@ -1649,6 +1649,14 @@ def run():
         con.execute("ALTER TABLE weekly_stats ADD COLUMN time_exits INTEGER DEFAULT 0")
         con.commit()
         log.info("  Migrated weekly_stats: added time_exits column")
+
+    # Repair NULL qty from legacy schema — prevents manage_positions crash
+    repaired = con.execute(
+        "UPDATE trades SET qty=1 WHERE qty IS NULL AND status='open'"
+    ).rowcount
+    con.commit()
+    if repaired:
+        log.info(f"  Repaired {repaired} trades with NULL qty")
 
     # Enforce MAX_OPEN on boot — keep top N by score, cancel rest with real P&L
     open_rows = con.execute(
