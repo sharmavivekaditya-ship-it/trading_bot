@@ -1215,28 +1215,28 @@ async function refresh(){
         <div class="pc-head">
           <div>
             <div class="pc-sym">${t.sym}</div>
-            <div class="pc-tag">BUY · Day ${t.days_held||0}/5 · Qty ${t.qty||'—'}</div>
+            <div class="pc-tag">BUY · Day ${t.days_held||0}/5</div>
           </div>
           <div class="pc-pnl">
             <div class="pc-pnl-v ${uc}">${us}Rs.${Math.abs(u).toLocaleString('en-IN')}</div>
-            <div class="pc-pnl-p">${us}${t.unreal_pct||0}% &nbsp;·&nbsp; ${t.qty||1} qty</div>
+            <div class="pc-pnl-p">${us}${t.unreal_pct||0}% · ${t.qty||1} qty</div>
           </div>
         </div>
         <div class="pc-row">
           <div>
             <div class="pc-item-lbl">Last · Qty</div>
-            <div class="pc-item-val"><span class="v-white">Rs.${lp.toLocaleString('en-IN')}</span></div>
             <div class="pc-item-val"><span class="v-white">Rs.${lp.toLocaleString('en-IN')}</span> <span style="color:var(--t4)">× ${t.qty||1}</span></div>
+          </div>
           <div>
-            <div class="pc-item-lbl">Entry · Position</div>
-            <div class="pc-item-val"><span class="v-amber">Rs.${t.entry}</span></div>
+            <div class="pc-item-lbl">Entry · Value</div>
             <div class="pc-item-val"><span class="v-amber">Rs.${t.entry}</span> <span style="color:var(--t4)">(Rs.${Math.round(t.entry*(t.qty||1)).toLocaleString('en-IN')})</span></div>
+          </div>
           <div>
             <div class="pc-item-lbl">Stop loss</div>
             <div class="pc-item-val"><span class="v-red">Rs.${t.sl}</span></div>
           </div>
           <div>
-            <div class="pc-item-lbl">Target</div>
+            <div class="pc-item-lbl">Target · R:R</div>
             <div class="pc-item-val"><span class="v-green">Rs.${t.target}</span> <span style="color:var(--t4)">${t.rr}×</span></div>
           </div>
         </div>
