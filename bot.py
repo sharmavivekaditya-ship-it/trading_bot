@@ -227,6 +227,14 @@ def weekly_rsi(sym, period=14):
 # ── SCREENER ──────────────────────────────────────────────────────────────────
 def screen(sym, cache_cutoff, con):
     """Return (setup_dict, None) on valid entry, (None, reason) otherwise."""
+    # Skip stocks manually closed today — prevent same-day re-entry
+    today = datetime.now().date().isoformat()
+    manual_today = con.execute(
+        "SELECT 1 FROM trades WHERE sym=? AND exit_reason='MANUAL_CLOSE' "
+        "AND closed_at >= ?", (sym, today)
+    ).fetchone()
+    if manual_today:
+        return None, "manual_close_today"
     row = con.execute(
         "SELECT price,daily_rsi,weekly_rsi,atr,score,entry,sl,target,reject "
         "FROM screener_cache WHERE sym=? AND updated_at>?",
@@ -1409,6 +1417,8 @@ def start_dashboard():
                 "UPDATE weekly_stats SET pnl=pnl+?,wins=wins+?,losses=losses+? WHERE week_start=?",
                 (pnl, 1 if pnl>0 else 0, 0 if pnl>0 else 1, ws2)
             )
+            # Invalidate screener cache — prevents immediate re-entry after manual close
+            con2.execute("DELETE FROM screener_cache WHERE sym=?", (sym.upper(),))
             con2.commit()
             con2.close()
             log.info(f"  MANUAL CLOSE {sym.upper()} @ Rs.{price:.2f}  P&L Rs.{pnl:+.2f}")
