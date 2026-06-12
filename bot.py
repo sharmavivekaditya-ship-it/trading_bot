@@ -60,7 +60,6 @@ BATCH_PAUSE      = 1
 MIN_PRICE        = 50
 MAX_PRICE        = 50_000
 MIN_AVG_VOL      = 200_000
-MIN_VOL_RATIO    = 0.8         # today's volume must be at least 80% of 20d avg
 MIN_SCORE        = 5.0         # minimum composite score to qualify for trading
 MIN_MCAP_CR      = 20_000      # Rs. Crores
 
@@ -257,11 +256,9 @@ def screen(sym, cache_cutoff, con):
             price   = float(c[-1])
             avg_vol = float(v[-20:].mean())
 
-            vol_r = float(v[-1]) / avg_vol if avg_vol > 0 else 0
             if   price < MIN_PRICE:     reject = f"price_low"
             elif price > MAX_PRICE:     reject = f"price_high"
             elif avg_vol < MIN_AVG_VOL: reject = f"low_vol"
-            elif vol_r < MIN_VOL_RATIO: reject = f"low_vol_today({vol_r:.1f}x)"
             else:
                 mcap = get_mcap(sym)
                 if mcap < MIN_MCAP_CR:
