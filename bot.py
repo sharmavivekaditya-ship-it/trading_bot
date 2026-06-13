@@ -65,8 +65,8 @@ MIN_MCAP_CR      = 20_000      # Rs. Crores
 
 # Strategy parameters
 RSI_PERIOD       = 14
-WEEKLY_RSI_MIN   = 57          # entry: weekly RSI floor (fresh momentum)
-WEEKLY_RSI_MAX   = 67          # entry: weekly RSI ceiling (not overextended)
+WEEKLY_RSI_MIN   = 60          # entry: weekly RSI floor
+WEEKLY_RSI_MAX   = 999         # entry: weekly RSI ceiling (none — trend can be strong)
 DAILY_RSI_MIN    = 57          # entry: daily RSI floor
 DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
 DAILY_RSI_EXIT   = 48          # exit: daily RSI drops below this
@@ -285,7 +285,7 @@ def screen(sym, cache_cutoff, con):
                         if wrsi_val < WEEKLY_RSI_MIN:
                             reject = f"weekly_rsi_low({wrsi_val:.0f})"
                         elif wrsi_val > WEEKLY_RSI_MAX:
-                            reject = f"weekly_rsi_high({wrsi_val:.0f})"  # overbought weekly
+                            pass  # no weekly ceiling — strong trend is fine
                         else:
                             # Quality filter 1: RSI 3-day trend check
                             # Not a hard "must be rising" — allows healthy consolidation
@@ -936,7 +936,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <span class="strat-lbl">Strategy</span>
   <span class="sc hi">DUAL RSI MOMENTUM</span>
   <span class="sc">Weekly RSI &gt; 60</span>
-  <span class="sc">Daily RSI &gt; 60</span>
+  <span class="sc">Daily RSI 57–67</span>
   <span class="sc">MCap &gt; Rs.20,000 Cr</span>
   <span class="sc">Stop: Entry − 2×ATR</span>
   <span class="sc">Exit: RSI&lt;50 · Divergence</span>
