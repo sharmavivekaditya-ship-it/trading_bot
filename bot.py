@@ -1392,7 +1392,7 @@ def start_dashboard():
             return jsonify({"error": str(e)})
 
 
-    @app.route("/analytics")
+    @app.route("/api/analytics")
     def analytics():
         """Strategy performance analytics — learns from trade history."""
         try:
