@@ -906,6 +906,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 <nav class="nav">
   <div class="nav-logo">⬡ FIRST-ORBIT PRO</div>
   <div class="nav-right">
+    <a href="/analytics" style="font-size:10px;color:var(--t3);text-decoration:none;padding:3px 8px;border:1px solid var(--b2);border-radius:4px;font-family:var(--mono)">ANALYTICS</a>
     <span class="chip paper">PAPER MODE</span>
     <span class="nav-clock" id="clk">--:--:-- IST</span>
     <span class="nav-dot pulse" id="dot"></span>
@@ -1351,12 +1352,21 @@ refresh();setInterval(refresh,5000);
 </html>"""
 
 
+ANALYTICS_HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>First-Orbit Analytics</title>\n<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n<style>\n:root{\n  --bg:#080c12;--s1:#0f1420;--s2:#141926;--b1:#1c2536;--b2:#222f44;\n  --t4:#2a3a54;--t3:#4a5a7a;--t2:#7a8faa;--t1:#b0c0d8;--white:#e8f0fa;\n  --green:#10b981;--red:#ef4444;--amber:#f59e0b;--blue:#60a5fa;--purple:#a78bfa;\n  --mono:\'JetBrains Mono\',monospace;--sans:\'Inter\',system-ui,sans-serif;\n}\n*{box-sizing:border-box;margin:0;padding:0}\nbody{background:var(--bg);color:var(--t1);font-family:var(--sans);font-size:14px}\n.nav{height:48px;background:var(--s1);border-bottom:1px solid var(--b1);padding:0 24px;display:flex;align-items:center;justify-content:space-between}\n.nav-logo{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--green);letter-spacing:2px}\n.nav-back{font-size:12px;color:var(--t3);text-decoration:none;display:flex;align-items:center;gap:6px}\n.nav-back:hover{color:var(--t1)}\n.page{max-width:1100px;margin:0 auto;padding:32px 24px}\n.page-title{font-size:22px;font-weight:600;color:var(--white);margin-bottom:4px}\n.page-sub{font-size:13px;color:var(--t3);margin-bottom:32px}\n\n/* Summary cards */\n.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:32px}\n@media(max-width:700px){.summary{grid-template-columns:1fr 1fr}}\n.scard{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:16px}\n.scard-lbl{font-size:10px;color:var(--t3);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}\n.scard-val{font-family:var(--mono);font-size:24px;font-weight:600;color:var(--white)}\n.scard-val.g{color:var(--green)}.scard-val.r{color:var(--red)}.scard-val.a{color:var(--amber)}\n.scard-sub{font-size:11px;color:var(--t4);margin-top:4px}\n\n/* Sections */\n.section{margin-bottom:32px}\n.section-title{font-size:13px;font-weight:600;color:var(--t2);letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--b1)}\n.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}\n@media(max-width:700px){.grid2{grid-template-columns:1fr}}\n\n/* Table */\n.tbl-wrap{background:var(--s1);border:1px solid var(--b1);border-radius:8px;overflow:hidden}\n.tbl{width:100%;border-collapse:collapse;font-size:13px}\n.tbl th{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--t3);padding:10px 16px;text-align:left;border-bottom:1px solid var(--b1);font-weight:500}\n.tbl td{padding:11px 16px;border-bottom:1px solid rgba(28,37,54,.6);font-family:var(--mono)}\n.tbl tr:last-child td{border-bottom:none}\n.tbl tr:hover td{background:var(--s2)}\n.pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--t3)}\n\n/* Bar chart */\n.bar-chart{display:flex;flex-direction:column;gap:8px}\n.bar-row{display:flex;align-items:center;gap:10px}\n.bar-label{font-size:11px;color:var(--t2);min-width:60px;font-family:var(--mono)}\n.bar-track{flex:1;height:8px;background:var(--s2);border-radius:4px;overflow:hidden}\n.bar-fill{height:100%;border-radius:4px;transition:width .6s}\n.bar-val{font-size:11px;font-family:var(--mono);min-width:50px;text-align:right}\n\n/* Recommendations */\n.rec-list{display:flex;flex-direction:column;gap:8px}\n.rec-item{background:var(--s1);border:1px solid var(--b1);border-left:3px solid var(--amber);border-radius:6px;padding:12px 14px;font-size:13px;color:var(--t1)}\n.rec-item.good{border-left-color:var(--green)}\n.rec-item.info{border-left-color:var(--blue)}\n\n/* Trade card */\n.trade-row{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--b1)}\n.trade-row:last-child{border-bottom:none}\n.trade-sym{font-family:var(--mono);font-weight:500;color:var(--white)}\n.trade-meta{font-size:11px;color:var(--t3);margin-top:2px}\n\n/* Loading / error */\n.loading{text-align:center;padding:60px;color:var(--t4);font-family:var(--mono);font-size:13px}\n.insufficient{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:40px;text-align:center;color:var(--t3);font-size:13px;line-height:1.8}\n</style>\n</head>\n<body>\n<nav class="nav">\n  <div class="nav-logo">⬡ FIRST-ORBIT PRO · ANALYTICS</div>\n  <a href="/" class="nav-back">← Dashboard</a>\n</nav>\n\n<div class="page">\n  <div class="page-title">Strategy Analytics</div>\n  <div class="page-sub">What the trade history is telling us — patterns, win rates, recommendations</div>\n\n  <div id="root"><div class="loading">Loading trade data...</div></div>\n</div>\n\n<script>\nasync function load() {\n  const root = document.getElementById(\'root\');\n  let d;\n  try {\n    const r = await fetch(\'/analytics\');\n    d = await r.json();\n  } catch(e) {\n    root.innerHTML = \'<div class="loading">Failed to load — is the bot running?</div>\';\n    return;\n  }\n\n  if (d.error) {\n    root.innerHTML = `<div class="insufficient">${d.error}</div>`;\n    return;\n  }\n\n  const s = d.summary;\n  const pf = s.profit_factor;\n\n  root.innerHTML = `\n    <!-- SUMMARY -->\n    <div class="summary">\n      <div class="scard">\n        <div class="scard-lbl">Total P&L</div>\n        <div class="scard-val ${s.total_pnl>=0?\'g\':\'r\'}">${s.total_pnl>=0?\'+\':\'\'}Rs.${Math.round(s.total_pnl).toLocaleString(\'en-IN\')}</div>\n        <div class="scard-sub">${s.total_trades} closed trades</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Win Rate</div>\n        <div class="scard-val ${s.win_rate>=50?\'g\':s.win_rate>=35?\'a\':\'r\'}">${s.win_rate}%</div>\n        <div class="scard-sub">need >40% to be profitable</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Expectancy</div>\n        <div class="scard-val ${s.expectancy>=0?\'g\':\'r\'}">${s.expectancy>=0?\'+\':\'\'}Rs.${s.expectancy}</div>\n        <div class="scard-sub">avg P&L per trade</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Profit Factor</div>\n        <div class="scard-val ${pf>=1.5?\'g\':pf>=1?\'a\':\'r\'}">${pf}×</div>\n        <div class="scard-sub">gross wins ÷ gross losses</div>\n      </div>\n    </div>\n\n    <!-- AVG WIN/LOSS -->\n    <div class="summary" style="grid-template-columns:1fr 1fr 1fr;margin-bottom:32px">\n      <div class="scard">\n        <div class="scard-lbl">Avg Win</div>\n        <div class="scard-val g">+Rs.${s.avg_win}</div>\n        <div class="scard-sub">per winning trade</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Avg Loss</div>\n        <div class="scard-val r">Rs.${s.avg_loss}</div>\n        <div class="scard-sub">per losing trade</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Win:Loss Ratio</div>\n        <div class="scard-val ${s.avg_loss!==0&&Math.abs(s.avg_win/s.avg_loss)>=1.5?\'g\':\'a\'}">${s.avg_loss!==0?Math.abs(s.avg_win/s.avg_loss).toFixed(2):\'—\'}×</div>\n        <div class="scard-sub">target: 1.5×</div>\n      </div>\n    </div>\n\n    <div class="grid2">\n      <!-- WIN RATE BY SCORE -->\n      <div class="section">\n        <div class="section-title">Win Rate by Setup Score</div>\n        <div class="tbl-wrap">\n          <table class="tbl">\n            <thead><tr><th>Score</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total</th></tr></thead>\n            <tbody>\n              ${Object.entries(d.by_score).map(([b,v])=>`\n                <tr>\n                  <td style="color:var(--white)">${b}</td>\n                  <td class="neu">${v.trades}</td>\n                  <td class="${v.win_rate>=50?\'pos\':v.win_rate>=35?\'\':\' neg\'}">${v.win_rate}%</td>\n                  <td class="${v.avg_pnl>=0?\'pos\':\'neg\'}">${v.avg_pnl>=0?\'+\':\'\'}Rs.${v.avg_pnl}</td>\n                  <td class="${v.total_pnl>=0?\'pos\':\'neg\'}">${v.total_pnl>=0?\'+\':\'\'}Rs.${v.total_pnl}</td>\n                </tr>`).join(\'\')}\n            </tbody>\n          </table>\n        </div>\n      </div>\n\n      <!-- WIN RATE BY DAYS HELD -->\n      <div class="section">\n        <div class="section-title">Win Rate by Days Held</div>\n        <div class="tbl-wrap">\n          <table class="tbl">\n            <thead><tr><th>Days</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th></tr></thead>\n            <tbody>\n              ${Object.entries(d.by_days_held).map(([b,v])=>`\n                <tr>\n                  <td style="color:var(--white)">${b===\'0\'?\'Same day\':b===\'1\'?\'1 day\':b+\' days\'}</td>\n                  <td class="neu">${v.trades}</td>\n                  <td class="${v.win_rate>=50?\'pos\':v.win_rate>=35?\'\':\' neg\'}">${v.win_rate}%</td>\n                  <td class="${v.avg_pnl>=0?\'pos\':\'neg\'}">${v.avg_pnl>=0?\'+\':\'\'}Rs.${v.avg_pnl}</td>\n                </tr>`).join(\'\')}\n            </tbody>\n          </table>\n        </div>\n      </div>\n    </div>\n\n    <!-- EXIT REASON BREAKDOWN -->\n    <div class="section">\n      <div class="section-title">Exit Signal Performance</div>\n      <div class="tbl-wrap">\n        <table class="tbl">\n          <thead><tr><th>Exit Reason</th><th>Wins</th><th>Losses</th><th>Total P&L</th><th>Assessment</th></tr></thead>\n          <tbody>\n            ${Object.entries(d.by_exit_reason).map(([reason, v])=>{\n              const total = v.wins + v.losses;\n              const wr = total ? Math.round(v.wins/total*100) : 0;\n              const assess = wr >= 60 ? \'✓ Working\' : wr >= 40 ? \'~ Neutral\' : \'✕ Review\';\n              const assessCls = wr >= 60 ? \'pos\' : wr >= 40 ? \'neu\' : \'neg\';\n              return `<tr>\n                <td style="color:var(--white)">${reason}</td>\n                <td class="pos">${v.wins}</td>\n                <td class="neg">${v.losses}</td>\n                <td class="${v.pnl>=0?\'pos\':\'neg\'}">${v.pnl>=0?\'+\':\'\'}Rs.${v.pnl}</td>\n                <td class="${assessCls}">${assess} (${wr}%)</td>\n              </tr>`;\n            }).join(\'\')}\n          </tbody>\n        </table>\n      </div>\n    </div>\n\n    <div class="grid2">\n      <!-- BEST TRADES -->\n      <div class="section">\n        <div class="section-title">Best Trades</div>\n        <div class="tbl-wrap">\n          ${d.best_trades.map(t=>`\n            <div class="trade-row">\n              <div>\n                <div class="trade-sym">${t.sym}</div>\n                <div class="trade-meta">${t.reason} · score ${t.score} · ${t.days}d</div>\n              </div>\n              <div class="pos">+Rs.${t.pnl.toLocaleString(\'en-IN\')}</div>\n            </div>`).join(\'\')}\n        </div>\n      </div>\n\n      <!-- WORST TRADES -->\n      <div class="section">\n        <div class="section-title">Worst Trades</div>\n        <div class="tbl-wrap">\n          ${[...d.worst_trades].reverse().map(t=>`\n            <div class="trade-row">\n              <div>\n                <div class="trade-sym">${t.sym}</div>\n                <div class="trade-meta">${t.reason} · score ${t.score} · ${t.days}d</div>\n              </div>\n              <div class="neg">Rs.${t.pnl.toLocaleString(\'en-IN\')}</div>\n            </div>`).join(\'\')}\n        </div>\n      </div>\n    </div>\n\n    <!-- RECOMMENDATIONS -->\n    <div class="section">\n      <div class="section-title">What the Data Suggests</div>\n      <div class="rec-list">\n        ${d.recommendations.map(r=>`<div class="rec-item">💡 ${r}</div>`).join(\'\')}\n      </div>\n      <div style="font-size:11px;color:var(--t4);margin-top:12px;padding:0 4px">\n        Recommendations require 20+ real strategy exits to be statistically meaningful. \n        Current count: ${s.total_trades} trades.\n      </div>\n    </div>\n  `;\n}\n\nload();\n</script>\n</body>\n</html>\n'
+
+
 def start_dashboard():
     app = Flask(__name__)
 
     @app.route("/")
     def index():
         return render_template_string(DASHBOARD_HTML)
+
+    @app.route("/analytics")
+    def analytics_page():
+        return ANALYTICS_HTML
+
+
 
     @app.route("/health")
     def health():
@@ -1380,6 +1390,144 @@ def start_dashboard():
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)})
+
+
+    @app.route("/analytics")
+    def analytics():
+        """Strategy performance analytics — learns from trade history."""
+        try:
+            con2 = sqlite3.connect(DB_PATH)
+
+            # Only real strategy exits — no cancelled/excess
+            REAL = (
+                "status IN ('win','loss') "
+                "AND exit_reason NOT LIKE '%EXCESS%' "
+                "AND exit_reason NOT LIKE '%CANCEL%' "
+                "AND exit_reason NOT LIKE '%BOOT%' "
+                "AND exit_reason NOT LIKE 'MANUAL_CLOSE'"
+            )
+            ALL_CLOSED = (
+                "status IN ('win','loss') "
+                "AND exit_reason NOT LIKE '%EXCESS%' "
+                "AND exit_reason NOT LIKE '%CANCEL%' "
+                "AND exit_reason NOT LIKE '%BOOT%'"
+            )
+
+            rows = con2.execute(
+                f"SELECT sym, pnl, score, days_held, exit_reason, opened_at, closed_at, entry "
+                f"FROM trades WHERE {ALL_CLOSED} ORDER BY closed_at DESC"
+            ).fetchall()
+
+            if not rows:
+                return jsonify({"error": "No closed trades yet — need more data"}), 200
+
+            trades = []
+            for r in rows:
+                sym, pnl, score, days, reason, opened, closed, entry = r
+                trades.append({
+                    "sym": sym, "pnl": float(pnl or 0),
+                    "score": float(score or 0), "days": int(days or 0),
+                    "reason": reason or "", "entry": float(entry or 0),
+                })
+
+            total     = len(trades)
+            wins      = [t for t in trades if t["pnl"] > 0]
+            losses    = [t for t in trades if t["pnl"] <= 0]
+            win_rate  = round(len(wins) / total * 100, 1) if total else 0
+            avg_win   = round(sum(t["pnl"] for t in wins) / len(wins), 2) if wins else 0
+            avg_loss  = round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0
+            total_pnl = round(sum(t["pnl"] for t in trades), 2)
+            expectancy = round((win_rate/100 * avg_win) + ((1-win_rate/100) * avg_loss), 2)
+
+            # Win rate by score bucket
+            score_buckets = {"5-10": [], "10-15": [], "15-20": [], "20+": []}
+            for t in trades:
+                s = t["score"]
+                if s < 10:    score_buckets["5-10"].append(t["pnl"])
+                elif s < 15:  score_buckets["10-15"].append(t["pnl"])
+                elif s < 20:  score_buckets["15-20"].append(t["pnl"])
+                else:         score_buckets["20+"].append(t["pnl"])
+
+            score_stats = {}
+            for bucket, pnls in score_buckets.items():
+                if pnls:
+                    w = sum(1 for p in pnls if p > 0)
+                    score_stats[bucket] = {
+                        "trades": len(pnls),
+                        "win_rate": round(w/len(pnls)*100, 1),
+                        "avg_pnl": round(sum(pnls)/len(pnls), 2),
+                        "total_pnl": round(sum(pnls), 2),
+                    }
+
+            # Win rate by days held
+            days_buckets = {"0": [], "1": [], "2-3": [], "4+": []}
+            for t in trades:
+                d = t["days"]
+                if d == 0:   days_buckets["0"].append(t["pnl"])
+                elif d == 1: days_buckets["1"].append(t["pnl"])
+                elif d <= 3: days_buckets["2-3"].append(t["pnl"])
+                else:        days_buckets["4+"].append(t["pnl"])
+
+            days_stats = {}
+            for bucket, pnls in days_buckets.items():
+                if pnls:
+                    w = sum(1 for p in pnls if p > 0)
+                    days_stats[bucket] = {
+                        "trades": len(pnls),
+                        "win_rate": round(w/len(pnls)*100, 1),
+                        "avg_pnl": round(sum(pnls)/len(pnls), 2),
+                    }
+
+            # Exit reason breakdown
+            exit_counts = {}
+            for t in trades:
+                r = t["reason"].split("(")[0]
+                if r not in exit_counts:
+                    exit_counts[r] = {"wins": 0, "losses": 0, "pnl": 0}
+                if t["pnl"] > 0: exit_counts[r]["wins"] += 1
+                else:             exit_counts[r]["losses"] += 1
+                exit_counts[r]["pnl"] = round(exit_counts[r]["pnl"] + t["pnl"], 2)
+
+            # Best and worst trades
+            sorted_trades = sorted(trades, key=lambda x: x["pnl"], reverse=True)
+            best  = sorted_trades[:3]
+            worst = sorted_trades[-3:]
+
+            # Recommendation engine — what does the data suggest?
+            recommendations = []
+            if score_stats.get("5-10", {}).get("win_rate", 100) < 30:
+                recommendations.append("Low-score trades (5-10) underperforming — consider raising MIN_SCORE to 10")
+            if score_stats.get("20+", {}).get("win_rate", 0) > 60:
+                recommendations.append("High-score trades (20+) winning more — consider prioritising score > 20")
+            if days_stats.get("0", {}).get("win_rate", 100) < 25:
+                recommendations.append("Same-day exits losing — divergence exit may be triggering too early")
+            if avg_loss != 0 and abs(avg_win / avg_loss) < 1.2:
+                recommendations.append("R:R in practice below 1.2 — consider tightening stops or widening targets")
+            if win_rate < 35 and total >= 10:
+                recommendations.append("Win rate below 35% — strategy needs refinement or market is in wrong regime")
+            if not recommendations:
+                recommendations.append("Not enough data yet — need 20+ trades for reliable patterns")
+
+            con2.close()
+            return jsonify({
+                "summary": {
+                    "total_trades": total,
+                    "win_rate": win_rate,
+                    "total_pnl": total_pnl,
+                    "avg_win": avg_win,
+                    "avg_loss": avg_loss,
+                    "expectancy": expectancy,
+                    "profit_factor": round(abs(sum(t["pnl"] for t in wins) / sum(t["pnl"] for t in losses)), 2) if losses and sum(t["pnl"] for t in losses) != 0 else 0,
+                },
+                "by_score": score_stats,
+                "by_days_held": days_stats,
+                "by_exit_reason": exit_counts,
+                "best_trades": best,
+                "worst_trades": worst,
+                "recommendations": recommendations,
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/close/<sym>", methods=["POST"])
     def manual_close(sym):
