@@ -50,6 +50,13 @@ import threading
 CAPITAL          = 100_000
 MAX_WEEKLY_RISK  = 3_000
 RISK_PER_TRADE   = 800
+
+# ── EXECUTION MODE ────────────────────────────────────────────────────────────
+# LIVE_MODE stays False until: (1) Kite app created, (2) DDPI mandate cleared,
+# (3) static-IP hosting in place, (4) real signal-exit track record exists.
+LIVE_MODE        = os.environ.get("FIRST_ORBIT_LIVE", "0") == "1"
+KITE_API_KEY     = os.environ.get("KITE_API_KEY", "")
+KITE_ACCESS_TOKEN= os.environ.get("KITE_ACCESS_TOKEN", "")
 MAX_OPEN         = 5           # hard cap on concurrent positions
 TOP_N            = 5           # take top N setups by score each scan
 SCAN_INTERVAL    = 300         # seconds between cycles
@@ -140,6 +147,65 @@ def init_db():
     """)
     con.commit()
     return con
+
+
+# ── BROKER EXECUTION LAYER ────────────────────────────────────────────────────
+# All order placement and live pricing routes through Broker. In paper mode it
+# simulates fills at the given price. In live mode it calls Kite Connect. The
+# strategy logic above never changes — only this layer swaps paper <-> live.
+class Broker:
+    def __init__(self):
+        self.live = LIVE_MODE
+        self.kite = None
+        if self.live:
+            try:
+                from kiteconnect import KiteConnect
+                self.kite = KiteConnect(api_key=KITE_API_KEY)
+                self.kite.set_access_token(KITE_ACCESS_TOKEN)
+                log.info("  Broker: LIVE mode — Kite Connect active")
+            except Exception as e:
+                log.error(f"  Broker: Kite init failed ({e}) — refusing to trade live")
+                # Fail safe: if live init fails, do NOT silently fall back to paper
+                # and do NOT trade. Raise so the operator notices.
+                raise
+        else:
+            log.info("  Broker: PAPER mode — simulated fills, no real orders")
+
+    def place_buy(self, sym, qty, price):
+        """Place a BUY. Paper: returns simulated fill. Live: real CNC market order."""
+        if not self.live:
+            return {"status": "PAPER_FILL", "sym": sym, "qty": qty, "price": price}
+        # LIVE — real order. CNC = delivery (for swing holds).
+        order_id = self.kite.place_order(
+            variety=self.kite.VARIETY_REGULAR,
+            exchange=self.kite.EXCHANGE_NSE,
+            tradingsymbol=sym,
+            transaction_type=self.kite.TRANSACTION_TYPE_BUY,
+            quantity=qty,
+            product=self.kite.PRODUCT_CNC,
+            order_type=self.kite.ORDER_TYPE_MARKET,
+        )
+        return {"status": "LIVE_PLACED", "order_id": order_id, "sym": sym, "qty": qty}
+
+    def place_sell(self, sym, qty, price):
+        """Place a SELL. Paper: simulated. Live: real CNC market sell (needs DDPI)."""
+        if not self.live:
+            return {"status": "PAPER_FILL", "sym": sym, "qty": qty, "price": price}
+        order_id = self.kite.place_order(
+            variety=self.kite.VARIETY_REGULAR,
+            exchange=self.kite.EXCHANGE_NSE,
+            tradingsymbol=sym,
+            transaction_type=self.kite.TRANSACTION_TYPE_SELL,
+            quantity=qty,
+            product=self.kite.PRODUCT_CNC,
+            order_type=self.kite.ORDER_TYPE_MARKET,
+        )
+        return {"status": "LIVE_PLACED", "order_id": order_id, "sym": sym, "qty": qty}
+
+    def mode_label(self):
+        return "LIVE" if self.live else "PAPER"
+
+broker = Broker()
 
 # ── MARKET HOURS ─────────────────────────────────────────────────────────────
 def ist_now():
@@ -430,6 +496,11 @@ def manage_positions(con):
         if reason:
             pnl    = round((price - t["entry"]) * (t["qty"] or 1), 2)
             status = "win" if pnl > 0 else "loss"
+            # Route exit through broker — paper simulates, live places real Kite sell
+            fill = broker.place_sell(t["sym"], t["qty"] or 1, price)
+            if broker.live and fill.get("status") != "LIVE_PLACED":
+                log.error(f"  LIVE SELL {t['sym']} failed — position still open. Fill: {fill}")
+                continue
             con.execute(
                 "UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=? WHERE id=?",
                 (status, pnl, datetime.now().isoformat(), reason, t["id"])
@@ -496,6 +567,11 @@ def quick_replace(con, slots_needed):
         qty         = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
         actual_risk = round(qty * rp, 2)
         rr          = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)
+        # Route through broker — paper simulates, live places real Kite order
+        fill = broker.place_buy(sym, qty, entry)
+        if broker.live and fill.get("status") != "LIVE_PLACED":
+            log.error(f"  LIVE BUY {sym} failed — skipping. Fill: {fill}")
+            continue
         con.execute("""
             INSERT INTO trades
             (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
@@ -600,6 +676,11 @@ def scan_and_trade(universe, con):
             continue
         qty = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
         actual_risk = round(qty * rp, 2)
+        # Route through broker — paper simulates, live places real Kite order
+        fill = broker.place_buy(s["sym"], qty, s["entry"])
+        if broker.live and fill.get("status") != "LIVE_PLACED":
+            log.error(f"  LIVE BUY {s['sym']} failed — skipping. Fill: {fill}")
+            continue
         con.execute("""
             INSERT INTO trades
             (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
@@ -907,7 +988,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <div class="nav-logo">⬡ FIRST-ORBIT PRO</div>
   <div class="nav-right">
     <a href="/analytics" style="font-size:10px;color:var(--t3);text-decoration:none;padding:3px 8px;border:1px solid var(--b2);border-radius:4px;font-family:var(--mono)">ANALYTICS</a>
-    <span class="chip paper">PAPER MODE</span>
+    <span class="chip paper" id="mode-chip">PAPER MODE</span>
     <span class="nav-clock" id="clk">--:--:-- IST</span>
     <span class="nav-dot pulse" id="dot"></span>
   </div>
@@ -1147,6 +1228,7 @@ async function refresh(){
     d=await(await fetch('/api/status')).json();
     const dot=document.getElementById('dot');
     dot.style.background='var(--green)';dot.style.boxShadow='0 0 5px var(--green)';
+    if(d.mode){const mc=document.getElementById('mode-chip');if(mc){mc.textContent=d.mode+' MODE';if(d.mode==='LIVE'){mc.style.color='var(--red)';mc.style.borderColor='var(--rbr)';mc.style.background='var(--rbg)';}}}
   }catch(e){
     const dot=document.getElementById('dot');
     dot.style.background='var(--red)';dot.style.boxShadow='none';
@@ -1376,6 +1458,51 @@ def start_dashboard():
     def ping():
         return "pong", 200
 
+    @app.route("/kite/login")
+    def kite_login():
+        """Step 1: redirect the user to Kite's login page."""
+        if not KITE_API_KEY:
+            return "KITE_API_KEY not set in environment", 500
+        url = f"https://kite.zerodha.com/connect/login?api_key={KITE_API_KEY}&v=3"
+        return (f'<html><body style="font-family:monospace;background:#0a0d12;color:#b0c0d8;padding:40px">'
+                f'<h2 style="color:#10b981">Kite Connect — Login</h2>'
+                f'<p>Click below to authorise. After login, Kite redirects back and we exchange the token.</p>'
+                f'<p><a href="{url}" style="color:#60a5fa">→ Log in to Kite</a></p>'
+                f'<p style="color:#4a5a7a;font-size:12px">Bot stays in PAPER mode regardless. This only verifies auth works.</p>'
+                f'</body></html>')
+
+    @app.route("/kite/callback")
+    def kite_callback():
+        """Step 2: Kite redirects here with request_token. Exchange it for access token."""
+        from flask import request
+        request_token = request.args.get("request_token", "")
+        if not request_token:
+            return "No request_token in callback — login may have failed", 400
+        api_secret = os.environ.get("KITE_API_SECRET", "")
+        if not (KITE_API_KEY and api_secret):
+            return "KITE_API_KEY / KITE_API_SECRET not set", 500
+        try:
+            from kiteconnect import KiteConnect
+            kc = KiteConnect(api_key=KITE_API_KEY)
+            data = kc.generate_session(request_token, api_secret=api_secret)
+            access_token = data["access_token"]
+            # Show it so the operator can set it as KITE_ACCESS_TOKEN env var.
+            # NOTE: token expires daily ~6 AM IST; must be regenerated.
+            return (f'<html><body style="font-family:monospace;background:#0a0d12;color:#b0c0d8;padding:40px">'
+                    f'<h2 style="color:#10b981">✓ Kite auth successful</h2>'
+                    f'<p>Connection works. Access token generated (valid until ~6 AM IST tomorrow).</p>'
+                    f'<p style="color:#4a5a7a">Set this as <b>KITE_ACCESS_TOKEN</b> in Railway if/when you go live:</p>'
+                    f'<p style="background:#141926;padding:12px;border-radius:6px;word-break:break-all;color:#e8f0fa">{access_token}</p>'
+                    f'<p style="color:#f59e0b;font-size:12px">Bot is still in PAPER mode. No orders placed. '
+                    f'Live trading requires FIRST_ORBIT_LIVE=1 AND a cleared DDPI mandate.</p>'
+                    f'</body></html>')
+        except Exception as e:
+            return (f'<html><body style="font-family:monospace;background:#0a0d12;color:#ef4444;padding:40px">'
+                    f'<h2>Kite auth failed</h2><p>{str(e)}</p>'
+                    f'<p style="color:#4a5a7a">Check API key/secret and that the redirect URL matches exactly.</p>'
+                    f'</body></html>'), 500
+
+
     @app.route("/debug/trades")
     def debug_trades():
         """Show all closed trades with their exit_reason and pnl — for debugging."""
@@ -1554,6 +1681,11 @@ def start_dashboard():
             qty   = qty or 1
             pnl   = round((price - entry) * qty, 2)
             status = "win" if pnl > 0 else "loss"
+            # Route through broker — paper simulates, live places real Kite sell
+            fill = broker.place_sell(sym.upper(), qty, price)
+            if broker.live and fill.get("status") != "LIVE_PLACED":
+                con2.close()
+                return jsonify({"error": f"Live sell failed for {sym}", "fill": fill}), 500
             con2.execute(
                 "UPDATE trades SET status=?,pnl=?,closed_at=?,exit_reason=? WHERE id=?",
                 (status, pnl, datetime.now().isoformat(), "MANUAL_CLOSE", tid)
@@ -1764,6 +1896,7 @@ def start_dashboard():
                 "closed":  closed_list,
                 "logs":    logs,
                 "indices": indices,
+                "mode":    broker.mode_label(),
                 "time":    datetime.now().strftime("%H:%M:%S"),
             })
 
