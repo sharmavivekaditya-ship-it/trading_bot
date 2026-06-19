@@ -153,6 +153,37 @@ def init_db():
 # All order placement and live pricing routes through Broker. In paper mode it
 # simulates fills at the given price. In live mode it calls Kite Connect. The
 # strategy logic above never changes — only this layer swaps paper <-> live.
+# ── KITE SESSION TOKEN (set via dashboard "Authenticate" button each morning) ──
+# Token is stored in the persistent DB so it survives restarts within the day.
+# Expires ~6 AM IST; operator re-authenticates each morning via the button.
+def _save_token(token):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("CREATE TABLE IF NOT EXISTS kite_session (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, created_at TEXT)")
+        con.execute("INSERT OR REPLACE INTO kite_session (id, token, created_at) VALUES (1, ?, ?)",
+                    (token, datetime.now().isoformat()))
+        con.commit(); con.close()
+    except Exception as e:
+        log.error(f"  Token save failed: {e}")
+
+def _get_saved_token():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("CREATE TABLE IF NOT EXISTS kite_session (id INTEGER PRIMARY KEY CHECK(id=1), token TEXT, created_at TEXT)")
+        row = con.execute("SELECT token, created_at FROM kite_session WHERE id=1").fetchone()
+        con.close()
+        if not row: return None
+        token, created = row
+        # Token invalid after 6 AM IST the day after creation
+        created_dt = datetime.fromisoformat(created)
+        expiry = (created_dt + timedelta(days=1)).replace(hour=6, minute=0, second=0, microsecond=0)
+        if datetime.now() > expiry:
+            return None  # stale — needs morning re-auth
+        return token
+    except Exception:
+        return None
+
+
 class Broker:
     def __init__(self):
         self.live = LIVE_MODE
@@ -160,8 +191,11 @@ class Broker:
         if self.live:
             try:
                 from kiteconnect import KiteConnect
+                token = _get_saved_token() or KITE_ACCESS_TOKEN
+                if not token:
+                    raise RuntimeError("No Kite access token — authenticate via dashboard button first")
                 self.kite = KiteConnect(api_key=KITE_API_KEY)
-                self.kite.set_access_token(KITE_ACCESS_TOKEN)
+                self.kite.set_access_token(token)
                 log.info("  Broker: LIVE mode — Kite Connect active")
             except Exception as e:
                 log.error(f"  Broker: Kite init failed ({e}) — refusing to trade live")
@@ -171,10 +205,25 @@ class Broker:
         else:
             log.info("  Broker: PAPER mode — simulated fills, no real orders")
 
+    def _refresh_token(self):
+        """Pull the latest token saved by the morning Authenticate button."""
+        if not self.live:
+            return True
+        token = _get_saved_token()
+        if not token:
+            return False
+        try:
+            self.kite.set_access_token(token)
+            return True
+        except Exception:
+            return False
+
     def place_buy(self, sym, qty, price):
         """Place a BUY. Paper: returns simulated fill. Live: real CNC market order."""
         if not self.live:
             return {"status": "PAPER_FILL", "sym": sym, "qty": qty, "price": price}
+        if not self._refresh_token():
+            return {"status": "NO_TOKEN", "sym": sym, "note": "re-authenticate via dashboard"}
         # LIVE — real order. CNC = delivery (for swing holds).
         order_id = self.kite.place_order(
             variety=self.kite.VARIETY_REGULAR,
@@ -191,6 +240,8 @@ class Broker:
         """Place a SELL. Paper: simulated. Live: real CNC market sell (needs DDPI)."""
         if not self.live:
             return {"status": "PAPER_FILL", "sym": sym, "qty": qty, "price": price}
+        if not self._refresh_token():
+            return {"status": "NO_TOKEN", "sym": sym, "note": "re-authenticate via dashboard"}
         order_id = self.kite.place_order(
             variety=self.kite.VARIETY_REGULAR,
             exchange=self.kite.EXCHANGE_NSE,
@@ -987,6 +1038,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 <nav class="nav">
   <div class="nav-logo">⬡ FIRST-ORBIT PRO</div>
   <div class="nav-right">
+    <a href="/kite/login" target="_blank" id="kite-btn" style="font-size:10px;color:var(--amber);text-decoration:none;padding:3px 8px;border:1px solid rgba(245,158,11,.3);border-radius:4px;font-family:var(--mono);background:var(--abg)">⚿ AUTHENTICATE</a>
     <a href="/analytics" style="font-size:10px;color:var(--t3);text-decoration:none;padding:3px 8px;border:1px solid var(--b2);border-radius:4px;font-family:var(--mono)">ANALYTICS</a>
     <span class="chip paper" id="mode-chip">PAPER MODE</span>
     <span class="nav-clock" id="clk">--:--:-- IST</span>
@@ -1229,6 +1281,7 @@ async function refresh(){
     const dot=document.getElementById('dot');
     dot.style.background='var(--green)';dot.style.boxShadow='0 0 5px var(--green)';
     if(d.mode){const mc=document.getElementById('mode-chip');if(mc){mc.textContent=d.mode+' MODE';if(d.mode==='LIVE'){mc.style.color='var(--red)';mc.style.borderColor='var(--rbr)';mc.style.background='var(--rbg)';}}}
+    const kb=document.getElementById('kite-btn');if(kb){if(d.kite_authed){kb.textContent='✓ KITE AUTHED';kb.style.color='var(--green)';kb.style.borderColor='var(--gbr)';kb.style.background='var(--gbg)';}else{kb.textContent='⚿ AUTHENTICATE';kb.style.color='var(--amber)';kb.style.borderColor='rgba(245,158,11,.3)';kb.style.background='var(--abg)';}}
   }catch(e){
     const dot=document.getElementById('dot');
     dot.style.background='var(--red)';dot.style.boxShadow='none';
@@ -1486,6 +1539,7 @@ def start_dashboard():
             kc = KiteConnect(api_key=KITE_API_KEY)
             data = kc.generate_session(request_token, api_secret=api_secret)
             access_token = data["access_token"]
+            _save_token(access_token)  # persist so the running bot uses it today
             # Show it so the operator can set it as KITE_ACCESS_TOKEN env var.
             # NOTE: token expires daily ~6 AM IST; must be regenerated.
             return (f'<html><body style="font-family:monospace;background:#0a0d12;color:#b0c0d8;padding:40px">'
@@ -1897,6 +1951,7 @@ def start_dashboard():
                 "logs":    logs,
                 "indices": indices,
                 "mode":    broker.mode_label(),
+                "kite_authed": _get_saved_token() is not None,
                 "time":    datetime.now().strftime("%H:%M:%S"),
             })
 
