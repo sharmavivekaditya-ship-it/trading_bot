@@ -3,3 +3,4 @@ curl_cffi>=0.6.0
 pandas>=2.0.0
 numpy>=1.26.0
 flask>=3.0.0
+kiteconnect>=4.2.0
