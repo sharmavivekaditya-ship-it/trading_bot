@@ -81,7 +81,7 @@ WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
 MAX_HOLD_DAYS    = 1           # force-exit after this many days (high-frequency)
 ATR_STOP_MULT    = 1.0         # stop  = entry - 1.0*ATR (tight scalp)
-ATR_TARGET_MULT  = 1.3         # target = entry + 1.3*ATR  → R:R 1.3 (positive)
+ATR_TARGET_MULT  = 1.5         # target = entry + 1.5*ATR  → R:R 1.5 (positive)
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
 
@@ -1089,8 +1089,8 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <span class="sc">Weekly RSI &gt; 60</span>
   <span class="sc">Daily RSI 57–67</span>
   <span class="sc">MCap &gt; Rs.20,000 Cr</span>
-  <span class="sc">Stop: Entry − 2×ATR</span>
-  <span class="sc">Exit: 1.2×ATR · 1-day max</span>
+  <span class="sc">TGT 1.5×ATR · Stop 1×ATR</span>
+  <span class="sc">Exit: TP/SL · 1-day max</span>
   <span class="sc">Top 5 · Nifty 500</span>
 </div>
 
