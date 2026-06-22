@@ -80,8 +80,8 @@ DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
 WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
 MAX_HOLD_DAYS    = 1           # force-exit after this many days (high-frequency)
-ATR_STOP_MULT    = 2.0         # stop  = entry - 2*ATR
-ATR_TARGET_MULT  = 1.2         # target = entry + 1.2*ATR  → fast exit (R:R 0.6)
+ATR_STOP_MULT    = 1.0         # stop  = entry - 1.0*ATR (tight scalp)
+ATR_TARGET_MULT  = 1.3         # target = entry + 1.3*ATR  → R:R 1.3 (positive)
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
 
