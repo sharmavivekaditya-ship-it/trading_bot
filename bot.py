@@ -76,11 +76,12 @@ WEEKLY_RSI_MIN   = 60          # entry: weekly RSI floor
 WEEKLY_RSI_MAX   = 999         # entry: weekly RSI ceiling (none — trend can be strong)
 DAILY_RSI_MIN    = 57          # entry: daily RSI floor
 DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
-DAILY_RSI_EXIT   = 48          # exit: daily RSI drops below this
+DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
 WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
+MAX_HOLD_DAYS    = 1           # force-exit after this many days (high-frequency)
 ATR_STOP_MULT    = 2.0         # stop  = entry - 2*ATR
-ATR_TARGET_MULT  = 3.0         # target = entry + 3*ATR  → R:R = 1.5
+ATR_TARGET_MULT  = 1.2         # target = entry + 1.2*ATR  → fast exit (R:R 0.6)
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
 
@@ -544,6 +545,9 @@ def manage_positions(con):
         if not reason and days >= MIN_DAYS_DIV:
             if bearish_divergence(t["sym"], DIV_LOOKBACK):
                 reason = "DIVERGENCE"
+        # High-frequency: force exit after MAX_HOLD_DAYS regardless of signal
+        if not reason and days >= MAX_HOLD_DAYS:
+            reason = f"MAX_HOLD({days}d)"
         if reason:
             pnl    = round((price - t["entry"]) * (t["qty"] or 1), 2)
             status = "win" if pnl > 0 else "loss"
@@ -1086,7 +1090,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <span class="sc">Daily RSI 57–67</span>
   <span class="sc">MCap &gt; Rs.20,000 Cr</span>
   <span class="sc">Stop: Entry − 2×ATR</span>
-  <span class="sc">Exit: RSI&lt;50 · Divergence</span>
+  <span class="sc">Exit: 1.2×ATR · 1-day max</span>
   <span class="sc">Top 5 · Nifty 500</span>
 </div>
 
@@ -1375,7 +1379,7 @@ async function refresh(){
         <div class="pc-head">
           <div>
             <div class="pc-sym">${t.sym}</div>
-            <div class="pc-tag">BUY · Day ${t.days_held||0}/5</div>
+            <div class="pc-tag">BUY · Day ${t.days_held||0}/1</div>
           </div>
           <div class="pc-pnl">
             <div class="pc-pnl-v ${uc}">${us}Rs.${Math.abs(u).toLocaleString('en-IN')}</div>
