@@ -1785,19 +1785,10 @@ def start_dashboard():
         try:
             con = sqlite3.connect(DB_PATH)
 
-            # Weekly stats
-            ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
-            con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
-            con.commit()
-            row = con.execute(
-                "SELECT pnl,risk_used,wins,losses FROM weekly_stats WHERE week_start=?", (ws,)
-            ).fetchone()
-            stats = {
-                "pnl":       float(row[0] or 0),
-                "risk_used": float(row[1] or 0),
-                "wins":      int(row[2] or 0),
-                "losses":    int(row[3] or 0),
-            }
+            # Use the SAME stats function the cycle log uses — lifetime P&L,
+            # lifetime W/L, including manual closes. (Previously read weekly_stats
+            # directly here, which is why the dashboard disagreed with the log.)
+            stats = get_stats(con)
 
             # Open positions — fetch live 1-min price
             open_rows = con.execute(
