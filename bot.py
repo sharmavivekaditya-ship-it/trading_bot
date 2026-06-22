@@ -79,10 +79,8 @@ DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
 DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
 WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
-SQUAREOFF_HOUR   = 15          # intraday square-off: close ALL positions at
-SQUAREOFF_MIN    = 20          # 15:20 IST — never hold overnight
-ATR_STOP_MULT    = 1.0         # stop  = entry - 1.0*ATR (tight scalp)
-ATR_TARGET_MULT  = 1.5         # target = entry + 1.5*ATR  → R:R 1.5 (positive)
+ATR_STOP_MULT    = 2.0         # stop  = entry - 2.0*ATR (swing, survives gaps)
+ATR_TARGET_MULT  = 3.0         # target = entry + 3.0*ATR  → R:R 1.5 (swing)
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
 
@@ -546,24 +544,8 @@ def manage_positions(con):
         if not reason and days >= MIN_DAYS_DIV:
             if bearish_divergence(t["sym"], DIV_LOOKBACK):
                 reason = "DIVERGENCE"
-        # Intraday square-off: flatten everything near close, never hold overnight.
-        # Also closes any position from a prior day immediately (safety net).
-        if not reason:
-            now_ist = ist_now()
-            past_squareoff = (now_ist.hour > SQUAREOFF_HOUR or
-                              (now_ist.hour == SQUAREOFF_HOUR and now_ist.minute >= SQUAREOFF_MIN))
-            if past_squareoff:
-                reason = "SQUAREOFF_EOD"
-            else:
-                # Held from a previous day (e.g. restart) — flatten on first scan today.
-                # Guard against missing/non-string opened_at on legacy rows.
-                try:
-                    opened_ist_date = (datetime.fromisoformat(str(t["opened_at"]))
-                                       + timedelta(hours=5, minutes=30)).date()
-                    if opened_ist_date < now_ist.date():
-                        reason = "SQUAREOFF_CARRY"
-                except (ValueError, TypeError):
-                    pass  # can't parse — leave for normal exits, don't crash
+        # Swing mode: carry positions across days. Exit only on a real signal
+        # (hard stop, RSI fade, weekly fade, or divergence). No time-based cap.
         if reason:
             pnl    = round((price - t["entry"]) * (t["qty"] or 1), 2)
             status = "win" if pnl > 0 else "loss"
@@ -1105,8 +1087,8 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <span class="sc">Weekly RSI &gt; 60</span>
   <span class="sc">Daily RSI 57–67</span>
   <span class="sc">MCap &gt; Rs.20,000 Cr</span>
-  <span class="sc">TGT 1.5×ATR · Stop 1×ATR</span>
-  <span class="sc">Exit: TP/SL · EOD square-off</span>
+  <span class="sc">TGT 3×ATR · Stop 2×ATR</span>
+  <span class="sc">Exit: RSI fade · Divergence</span>
   <span class="sc">Top 5 · Nifty 500</span>
 </div>
 
@@ -1395,7 +1377,7 @@ async function refresh(){
         <div class="pc-head">
           <div>
             <div class="pc-sym">${t.sym}</div>
-            <div class="pc-tag">BUY · intraday</div>
+            <div class="pc-tag">BUY · Day ${t.days_held||0}</div>
           </div>
           <div class="pc-pnl">
             <div class="pc-pnl-v ${uc}">${us}Rs.${Math.abs(u).toLocaleString('en-IN')}</div>
