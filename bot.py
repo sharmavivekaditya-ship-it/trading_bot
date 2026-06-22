@@ -763,40 +763,54 @@ def get_stats(con):
     ws = (date.today() - timedelta(days=date.today().weekday())).isoformat()
     con.execute("INSERT OR IGNORE INTO weekly_stats VALUES (?,0,0,0,0,0)", (ws,))
     con.commit()
-    r = con.execute(
-        "SELECT risk_used,wins,losses FROM weekly_stats WHERE week_start=?", (ws,)
+    # risk_used is the only genuinely weekly metric (resets for the Rs.3000 cap)
+    rw = con.execute(
+        "SELECT risk_used FROM weekly_stats WHERE week_start=?", (ws,)
     ).fetchone()
-    # Compute P&L directly from closed trades this week — ground truth
-    week_start_dt = ws + "T00:00:00"
-    # WHITELIST approach: only count trades closed by actual strategy signals
-    # Real exit reasons: HARD_STOP, DAILY_RSI_EXIT(...), WEEKLY_RSI_EXIT(...), DIVERGENCE, TARGET_HIT
-    # Everything else (EXCESS_ON_BOOT, EXCESS_CANCELLED, CANCELLED) is excluded
+    risk_used = float(rw[0]) if rw and rw[0] else 0.0
+
+    # LIFETIME realised P&L — every genuine exit, including manual closes.
+    # Excludes only the Day-1 cancelled/excess bug trades.
+    REAL = (
+        "status IN ('win','loss') "
+        "AND exit_reason NOT LIKE '%EXCESS%' "
+        "AND exit_reason NOT LIKE '%CANCEL%' "
+        "AND exit_reason NOT LIKE '%BOOT%'"
+    )
     pnl_row = con.execute(
-        "SELECT COALESCE(SUM(pnl),0) FROM trades "
-        "WHERE status IN ('win','loss') "
-        "AND ("
-        "  exit_reason LIKE 'HARD_STOP%' OR "
-        "  exit_reason LIKE 'DAILY_RSI%' OR "
-        "  exit_reason LIKE 'WEEKLY_RSI%' OR "
-        "  exit_reason LIKE 'DIVERGENCE%' OR "
-        "  exit_reason LIKE 'TARGET_HIT%' OR "
-        "  exit_reason LIKE 'RSI_OB%' "
-        ")"
+        f"SELECT COALESCE(SUM(pnl),0) FROM trades WHERE {REAL}"
     ).fetchone()
     real_pnl = float(pnl_row[0]) if pnl_row and pnl_row[0] is not None else 0.0
-    # Also compute cancelled P&L separately for transparency
+
+    # LIFETIME wins/losses (not weekly)
+    wl = con.execute(
+        f"SELECT "
+        f"SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END), "
+        f"SUM(CASE WHEN pnl<=0 THEN 1 ELSE 0 END) "
+        f"FROM trades WHERE {REAL}"
+    ).fetchone()
+    wins   = int(wl[0] or 0)
+    losses = int(wl[1] or 0)
+
+    # This-week realised P&L (for a separate weekly view if wanted)
+    week_pnl_row = con.execute(
+        f"SELECT COALESCE(SUM(pnl),0) FROM trades WHERE {REAL} AND closed_at >= ?",
+        (ws + "T00:00:00",)
+    ).fetchone()
+    week_pnl = float(week_pnl_row[0]) if week_pnl_row and week_pnl_row[0] is not None else 0.0
+
     cancelled_row = con.execute(
         "SELECT COALESCE(SUM(pnl),0) FROM trades "
-        "WHERE exit_reason LIKE '%EXCESS%' "
-        "OR exit_reason LIKE '%CANCEL%' "
-        "OR exit_reason LIKE '%BOOT%'"
+        "WHERE exit_reason LIKE '%EXCESS%' OR exit_reason LIKE '%CANCEL%' OR exit_reason LIKE '%BOOT%'"
     ).fetchone()
     cancelled_pnl = float(cancelled_row[0]) if cancelled_row and cancelled_row[0] else 0.0
+
     return {
-        "pnl":           real_pnl,
-        "risk_used":     float(r[0] or 0),
-        "wins":          int(r[1] or 0),
-        "losses":        int(r[2] or 0),
+        "pnl":           real_pnl,    # lifetime realised
+        "week_pnl":      week_pnl,    # this week realised
+        "risk_used":     risk_used,
+        "wins":          wins,        # lifetime
+        "losses":        losses,      # lifetime
         "cancelled_pnl": cancelled_pnl,
     }
 
@@ -1084,14 +1098,14 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
     <div class="met-sub" id="m-port-s">principal + P&amp;L</div>
   </div>
   <div class="met" style="border-left:2px solid var(--green);padding-left:16px">
-    <div class="met-lbl">Total P&amp;L</div>
+    <div class="met-lbl">Lifetime P&amp;L</div>
     <div class="met-val g" id="m-pnl">—</div>
-    <div class="met-sub">realised + unrealised</div>
+    <div class="met-sub" id="m-pnl-s">realised + unrealised</div>
   </div>
   <div class="met">
     <div class="met-lbl">Realised P&amp;L</div>
     <div class="met-val" id="m-real">Rs.0</div>
-    <div class="met-sub" id="m-real-s">closed trades only</div>
+    <div class="met-sub" id="m-real-s">lifetime, all closed</div>
   </div>
   <div class="met">
     <div class="met-lbl">Unrealised P&amp;L</div>
@@ -1099,7 +1113,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
     <div class="met-sub" id="m-unreal-s">open positions</div>
   </div>
   <div class="met">
-    <div class="met-lbl">Win Rate</div>
+    <div class="met-lbl">Win Rate (lifetime)</div>
     <div class="met-val"   id="m-wr">—</div>
     <div class="met-sub"   id="m-wr-s">0W / 0L</div>
   </div>
@@ -1305,7 +1319,12 @@ async function refresh(){
   pnlEl.textContent=(tp>=0?'+Rs.':'-Rs.')+Math.abs(Math.round(tp)).toLocaleString('en-IN');
   pnlEl.className='met-val '+(tp>=0?'g':'r');
 
-  // Realised P&L (closed strategy trades only)
+  // Lifetime P&L subtitle: show this week's contribution
+  const wpnl = s.week_pnl || 0;
+  const pnlSub = document.getElementById('m-pnl-s');
+  if (pnlSub) pnlSub.textContent = `lifetime · this week ${wpnl>=0?'+':''}Rs.${Math.round(wpnl).toLocaleString('en-IN')}`;
+
+  // Realised P&L (lifetime, all genuine closes incl manual)
   const realEl=document.getElementById('m-real');
   realEl.textContent=(realised>=0?'Rs.':'-Rs.')+Math.abs(Math.round(realised)).toLocaleString('en-IN');
   realEl.className='met-val '+(realised>0?'g':realised<0?'r':'');
