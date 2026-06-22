@@ -552,14 +552,18 @@ def manage_positions(con):
             now_ist = ist_now()
             past_squareoff = (now_ist.hour > SQUAREOFF_HOUR or
                               (now_ist.hour == SQUAREOFF_HOUR and now_ist.minute >= SQUAREOFF_MIN))
-            opened_date = datetime.fromisoformat(t["opened_at"]).date()
-            # Convert opened_at (server/UTC) to IST date for fair comparison
-            opened_ist_date = (datetime.fromisoformat(t["opened_at"]) + timedelta(hours=5, minutes=30)).date()
             if past_squareoff:
                 reason = "SQUAREOFF_EOD"
-            elif opened_ist_date < now_ist.date():
-                # Held from a previous day (e.g. restart) — flatten on first scan today
-                reason = "SQUAREOFF_CARRY"
+            else:
+                # Held from a previous day (e.g. restart) — flatten on first scan today.
+                # Guard against missing/non-string opened_at on legacy rows.
+                try:
+                    opened_ist_date = (datetime.fromisoformat(str(t["opened_at"]))
+                                       + timedelta(hours=5, minutes=30)).date()
+                    if opened_ist_date < now_ist.date():
+                        reason = "SQUAREOFF_CARRY"
+                except (ValueError, TypeError):
+                    pass  # can't parse — leave for normal exits, don't crash
         if reason:
             pnl    = round((price - t["entry"]) * (t["qty"] or 1), 2)
             status = "win" if pnl > 0 else "loss"
