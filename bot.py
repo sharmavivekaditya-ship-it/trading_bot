@@ -12,7 +12,7 @@ SCAN     : Two-pass — collect ALL setups across Nifty 500, rank by score, trad
 UNIVERSE : Nifty 500 (covers ~95% of NSE market cap)
 """
 
-import time, sqlite3, os, logging, io
+import time, sqlite3, os, logging, io, math
 from datetime import datetime, date, timedelta
 import urllib.request
 
@@ -145,6 +145,27 @@ def init_db():
         updated_at   TEXT
     );
     """)
+    con.commit()
+    # Before creating the unique index, collapse any pre-existing duplicate open
+    # rows (from the old buggy build) — otherwise the index creation would fail.
+    dupes = con.execute(
+        "SELECT sym FROM trades WHERE status='open' GROUP BY sym HAVING COUNT(*) > 1"
+    ).fetchall()
+    for (sym,) in dupes:
+        ids = [r[0] for r in con.execute(
+            "SELECT id FROM trades WHERE sym=? AND status='open' ORDER BY opened_at DESC", (sym,)
+        ).fetchall()]
+        for tid in ids[1:]:
+            con.execute(
+                "UPDATE trades SET status='loss',pnl=0,closed_at=?,exit_reason='DUP_CANCELLED' WHERE id=?",
+                (datetime.now().isoformat(), tid)
+            )
+    con.commit()
+    # Now safe to enforce: at most ONE open row per symbol.
+    con.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_per_sym "
+        "ON trades(sym) WHERE status='open'"
+    )
     con.commit()
     return con
 
@@ -344,14 +365,16 @@ def weekly_rsi(sym, period=14):
 # ── SCREENER ──────────────────────────────────────────────────────────────────
 def screen(sym, cache_cutoff, con):
     """Return (setup_dict, None) on valid entry, (None, reason) otherwise."""
-    # Skip stocks manually closed today — prevent same-day re-entry
+    # Skip stocks closed today by ANY exit (manual, RSI, stop, divergence) —
+    # prevents same-day churn where a signal exit frees the slot and the stock
+    # is immediately re-bought, only to exit again on the same reading.
     today = datetime.now().date().isoformat()
-    manual_today = con.execute(
-        "SELECT 1 FROM trades WHERE sym=? AND exit_reason='MANUAL_CLOSE' "
+    closed_today = con.execute(
+        "SELECT 1 FROM trades WHERE sym=? AND status IN ('win','loss') "
         "AND closed_at >= ?", (sym, today)
     ).fetchone()
-    if manual_today:
-        return None, "manual_close_today"
+    if closed_today:
+        return None, "closed_today"
     row = con.execute(
         "SELECT price,daily_rsi,weekly_rsi,atr,score,entry,sl,target,reject "
         "FROM screener_cache WHERE sym=? AND updated_at>?",
@@ -502,8 +525,21 @@ def manage_positions(con):
     if not rows:
         log.info("  No open positions")
         return
+    seen_syms = set()
     for row in rows:
         t = dict(zip(cols, row))
+        # Safety: if a duplicate open row for this symbol slipped through, only
+        # process the first one this cycle and cancel the rest (prevents the
+        # "sold multiple times" bug — same symbol selling on every duplicate row).
+        if t["sym"] in seen_syms:
+            con.execute(
+                "UPDATE trades SET status='loss',pnl=0,closed_at=?,exit_reason='DUP_CANCELLED' WHERE id=?",
+                (datetime.now().isoformat(), t["id"])
+            )
+            con.commit()
+            log.warning(f"  {t['sym']}: duplicate open row cancelled (kept the first)")
+            continue
+        seen_syms.add(t["sym"])
         # Fetch live price
         try:
             hist = yf.Ticker(t["sym"] + ".NS").history(
@@ -511,8 +547,9 @@ def manage_positions(con):
             price = float(hist["Close"].iloc[-1]) if len(hist) > 0 else None
         except Exception:
             price = None
-        if price is None:
-            log.warning(f"  {t['sym']}: price fetch failed")
+        # Backstop: never act on a missing or nan price (stale/after-hours data).
+        if price is None or not math.isfinite(price):
+            log.warning(f"  {t['sym']}: no valid price (got {price}) — skipping, no exit")
             continue
         # Update days held
         try:
@@ -614,7 +651,12 @@ def quick_replace(con, slots_needed):
             break
         if con.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'", (sym,)).fetchone():
             continue
-        rp = abs(entry - sl)
+        # Block re-entry of anything already closed today (any exit reason)
+        if con.execute(
+            "SELECT 1 FROM trades WHERE sym=? AND status IN ('win','loss') AND closed_at >= ?",
+            (sym, date.today().isoformat())
+        ).fetchone():
+            continue
         if rp <= 0:
             continue
         qty         = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
@@ -625,16 +667,20 @@ def quick_replace(con, slots_needed):
         if broker.live and fill.get("status") != "LIVE_PLACED":
             log.error(f"  LIVE BUY {sym} failed — skipping. Fill: {fill}")
             continue
-        con.execute("""
-            INSERT INTO trades
-            (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
-             status,pnl,days_held,opened_at,exit_reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',0,0,?,?)
-        """, (f"{sym}_{int(time.time())}", sym, "BUY",
-              entry, sl, target, qty, actual_risk,
-              round(qty * abs(entry - target), 2),
-              rr, score, datetime.now().isoformat(), ""))
-        con.commit()
+        try:
+            con.execute("""
+                INSERT INTO trades
+                (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
+                 status,pnl,days_held,opened_at,exit_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',0,0,?,?)
+            """, (f"{sym}_{int(time.time())}", sym, "BUY",
+                  entry, sl, target, qty, actual_risk,
+                  round(qty * abs(entry - target), 2),
+                  rr, score, datetime.now().isoformat(), ""))
+            con.commit()
+        except sqlite3.IntegrityError:
+            log.warning(f"  {sym}: already has an open position — skipping duplicate buy")
+            continue
         risk_left -= actual_risk
         placed    += 1
         log.info(f"  INSTANT BUY {sym}  qty:{qty}  @ Rs.{entry}"
@@ -734,21 +780,25 @@ def scan_and_trade(universe, con):
         if broker.live and fill.get("status") != "LIVE_PLACED":
             log.error(f"  LIVE BUY {s['sym']} failed — skipping. Fill: {fill}")
             continue
-        con.execute("""
-            INSERT INTO trades
-            (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
-             status,pnl,days_held,opened_at,exit_reason)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',0,0,?,?)
-        """, (
-            f"{s['sym']}_{int(time.time())}",
-            s["sym"], "BUY",
-            s["entry"], s["sl"], s["target"],
-            qty, actual_risk,
-            round(qty * abs(s["entry"] - s["target"]), 2),
-            s["rr"], s["score"],
-            datetime.now().isoformat(), ""
-        ))
-        con.commit()
+        try:
+            con.execute("""
+                INSERT INTO trades
+                (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
+                 status,pnl,days_held,opened_at,exit_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',0,0,?,?)
+            """, (
+                f"{s['sym']}_{int(time.time())}",
+                s["sym"], "BUY",
+                s["entry"], s["sl"], s["target"],
+                qty, actual_risk,
+                round(qty * abs(s["entry"] - s["target"]), 2),
+                s["rr"], s["score"],
+                datetime.now().isoformat(), ""
+            ))
+            con.commit()
+        except sqlite3.IntegrityError:
+            log.warning(f"  {s['sym']}: already has an open position — skipping duplicate buy")
+            continue
         risk_left -= actual_risk
         placed    += 1
         log.info(
@@ -1055,6 +1105,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <div class="nav-logo">⬡ FIRST-ORBIT PRO</div>
   <div class="nav-right">
     <a href="/kite/login" target="_blank" id="kite-btn" style="font-size:10px;color:var(--amber);text-decoration:none;padding:3px 8px;border:1px solid rgba(245,158,11,.3);border-radius:4px;font-family:var(--mono);background:var(--abg)">⚿ AUTHENTICATE</a>
+    <a href="/ledger" style="font-size:10px;color:var(--t3);text-decoration:none;padding:3px 8px;border:1px solid var(--b2);border-radius:4px;font-family:var(--mono)">LEDGER</a>
     <a href="/analytics" style="font-size:10px;color:var(--t3);text-decoration:none;padding:3px 8px;border:1px solid var(--b2);border-radius:4px;font-family:var(--mono)">ANALYTICS</a>
     <span class="chip paper" id="mode-chip">PAPER MODE</span>
     <span class="nav-clock" id="clk">--:--:-- IST</span>
@@ -1508,6 +1559,8 @@ refresh();setInterval(refresh,5000);
 </html>"""
 
 
+LEDGER_HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>First-Orbit Lifetime Ledger</title>\n<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n<style>\n:root{--bg:#080c12;--s1:#0f1420;--s2:#141926;--b1:#1c2536;--b2:#222f44;\n--t4:#2a3a54;--t3:#4a5a7a;--t2:#7a8faa;--t1:#b0c0d8;--white:#e8f0fa;\n--green:#10b981;--red:#ef4444;--amber:#f59e0b;--blue:#60a5fa;\n--mono:\'JetBrains Mono\',monospace;--sans:\'Inter\',system-ui,sans-serif;}\n*{box-sizing:border-box;margin:0;padding:0}\nbody{background:var(--bg);color:var(--t1);font-family:var(--sans);font-size:14px}\n.nav{height:48px;background:var(--s1);border-bottom:1px solid var(--b1);padding:0 24px;display:flex;align-items:center;justify-content:space-between}\n.nav-logo{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--green);letter-spacing:2px}\n.nav-back{font-size:12px;color:var(--t3);text-decoration:none}\n.nav-back:hover{color:var(--t1)}\n.page{max-width:1200px;margin:0 auto;padding:32px 24px}\n.page-title{font-size:22px;font-weight:600;color:var(--white);margin-bottom:4px}\n.page-sub{font-size:13px;color:var(--t3);margin-bottom:32px}\n.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:32px}\n@media(max-width:700px){.summary{grid-template-columns:1fr 1fr}}\n.scard{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:16px}\n.scard-lbl{font-size:10px;color:var(--t3);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}\n.scard-val{font-family:var(--mono);font-size:24px;font-weight:600;color:var(--white)}\n.scard-val.g{color:var(--green)}.scard-val.r{color:var(--red)}.scard-val.a{color:var(--amber)}\n.scard-sub{font-size:11px;color:var(--t4);margin-top:4px}\n.tbl-wrap{background:var(--s1);border:1px solid var(--b1);border-radius:8px;overflow-x:auto}\n.tbl{width:100%;border-collapse:collapse;font-size:12.5px}\n.tbl th{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);padding:9px 14px;text-align:left;border-bottom:1px solid var(--b1);font-weight:500;white-space:nowrap}\n.tbl td{padding:9px 14px;border-bottom:1px solid rgba(28,37,54,.5);font-family:var(--mono);white-space:nowrap}\n.tbl tr:last-child td{border-bottom:none}\n.tbl tr:hover td{background:var(--s2)}\n.pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--t3)}\n.tag{font-size:9px;padding:2px 6px;border-radius:3px;letter-spacing:.5px}\n.tag-open{background:rgba(96,165,250,.15);color:var(--blue)}\n.tag-real{background:rgba(16,185,129,.12);color:var(--green)}\n.tag-noise{background:rgba(74,90,122,.15);color:var(--t3)}\n.loading{text-align:center;padding:60px;color:var(--t4);font-family:var(--mono)}\n.filter-row{display:flex;gap:8px;margin-bottom:16px}\n.fbtn{font-size:11px;font-family:var(--mono);padding:5px 12px;border:1px solid var(--b2);border-radius:5px;background:transparent;color:var(--t2);cursor:pointer}\n.fbtn.active{border-color:var(--green);color:var(--green);background:rgba(16,185,129,.08)}\n</style>\n</head>\n<body>\n<nav class="nav">\n  <div class="nav-logo">HEXAGON FIRST-ORBIT PRO · LIFETIME LEDGER</div>\n  <a href="/" class="nav-back">&larr; Dashboard</a>\n</nav>\n<div class="page">\n  <div class="page-title">Lifetime Trade Ledger</div>\n  <div class="page-sub">Every trade ever recorded, with running lifetime P&L. Full audit trail — nothing resets.</div>\n  <div id="root"><div class="loading">Loading ledger...</div></div>\n</div>\n<script>\nlet ALL=[],FILTER=\'genuine\';\nasync function load(){\n  const root=document.getElementById(\'root\');\n  let d;\n  try{const r=await fetch(\'/api/ledger\');d=await r.json();}\n  catch(e){root.innerHTML=\'<div class="loading">Failed to load.</div>\';return;}\n  if(d.error){root.innerHTML=\'<div class="loading">\'+d.error+\'</div>\';return;}\n  ALL=d.trades;const s=d.summary;\n  const head=`<div class="summary">\n    <div class="scard"><div class="scard-lbl">Lifetime Realised P&L</div>\n      <div class="scard-val ${s.lifetime_pnl>=0?\'g\':\'r\'}">${s.lifetime_pnl>=0?\'+\':\'\'}Rs.${Math.round(s.lifetime_pnl).toLocaleString(\'en-IN\')}</div>\n      <div class="scard-sub">${s.realised_trades} genuine closed trades</div></div>\n    <div class="scard"><div class="scard-lbl">Win Rate</div>\n      <div class="scard-val ${s.win_rate>=50?\'g\':s.win_rate>=40?\'a\':\'r\'}">${s.win_rate}%</div>\n      <div class="scard-sub">${s.wins}W / ${s.losses}L</div></div>\n    <div class="scard"><div class="scard-lbl">Total Rows</div>\n      <div class="scard-val">${s.total_rows}</div>\n      <div class="scard-sub">incl. open & cancelled</div></div>\n    <div class="scard"><div class="scard-lbl">Avg per Trade</div>\n      <div class="scard-val ${s.lifetime_pnl>=0?\'g\':\'r\'}">${s.realised_trades?(s.lifetime_pnl>=0?\'+\':\'\')+\'Rs.\'+(s.lifetime_pnl/s.realised_trades).toFixed(1):\'—\'}</div>\n      <div class="scard-sub">expectancy</div></div>\n  </div>\n  <div class="filter-row">\n    <button class="fbtn ${FILTER===\'genuine\'?\'active\':\'\'}" onclick="setF(\'genuine\')">Genuine only</button>\n    <button class="fbtn ${FILTER===\'all\'?\'active\':\'\'}" onclick="setF(\'all\')">All rows</button>\n    <button class="fbtn ${FILTER===\'open\'?\'active\':\'\'}" onclick="setF(\'open\')">Open</button>\n  </div>`;\n  root.innerHTML=head+\'<div class="tbl-wrap"><table class="tbl"><thead><tr>\'+\n    \'<th>#</th><th>Symbol</th><th>Entry</th><th>Qty</th><th>P&L</th><th>Running P&L</th><th>Score</th><th>Exit</th><th>Status</th><th>Opened</th><th>Closed</th></tr></thead><tbody id="tb"></tbody></table></div>\';\n  render();\n}\nfunction setF(f){FILTER=f;document.querySelectorAll(\'.fbtn\').forEach(b=>b.classList.remove(\'active\'));event.target.classList.add(\'active\');render();}\nfunction render(){\n  let rows=ALL;\n  if(FILTER===\'genuine\')rows=ALL.filter(t=>t.genuine);\n  else if(FILTER===\'open\')rows=ALL.filter(t=>t.status===\'open\');\n  const fmt=x=>x==null?\'\':(x.length>16?x.slice(5,16).replace(\'T\',\' \'):x);\n  document.getElementById(\'tb\').innerHTML=rows.map((t,i)=>{\n    const tag=t.status===\'open\'?\'<span class="tag tag-open">OPEN</span>\':\n      t.genuine?\'<span class="tag tag-real">REAL</span>\':\'<span class="tag tag-noise">\'+(t.exit_reason||\'\').slice(0,8)+\'</span>\';\n    return `<tr>\n      <td class="neu">${i+1}</td>\n      <td style="color:var(--white)">${t.sym}</td>\n      <td>Rs.${t.entry}</td>\n      <td class="neu">${t.qty}</td>\n      <td class="${t.pnl>0?\'pos\':t.pnl<0?\'neg\':\'neu\'}">${t.pnl>0?\'+\':\'\'}${t.pnl?\'Rs.\'+t.pnl:\'—\'}</td>\n      <td class="${t.running_pnl>=0?\'pos\':\'neg\'}">${t.running_pnl==null?\'—\':(t.running_pnl>=0?\'+\':\'\')+\'Rs.\'+t.running_pnl}</td>\n      <td class="neu">${t.score||\'\'}</td>\n      <td class="neu" style="font-size:11px">${(t.exit_reason||\'\').slice(0,18)}</td>\n      <td>${tag}</td>\n      <td class="neu" style="font-size:11px">${fmt(t.opened_at)}</td>\n      <td class="neu" style="font-size:11px">${fmt(t.closed_at)}</td>\n    </tr>`;}).join(\'\');\n}\nload();\n</script>\n</body>\n</html>\n'
+
 ANALYTICS_HTML = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>First-Orbit Analytics</title>\n<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">\n<style>\n:root{\n  --bg:#080c12;--s1:#0f1420;--s2:#141926;--b1:#1c2536;--b2:#222f44;\n  --t4:#2a3a54;--t3:#4a5a7a;--t2:#7a8faa;--t1:#b0c0d8;--white:#e8f0fa;\n  --green:#10b981;--red:#ef4444;--amber:#f59e0b;--blue:#60a5fa;--purple:#a78bfa;\n  --mono:\'JetBrains Mono\',monospace;--sans:\'Inter\',system-ui,sans-serif;\n}\n*{box-sizing:border-box;margin:0;padding:0}\nbody{background:var(--bg);color:var(--t1);font-family:var(--sans);font-size:14px}\n.nav{height:48px;background:var(--s1);border-bottom:1px solid var(--b1);padding:0 24px;display:flex;align-items:center;justify-content:space-between}\n.nav-logo{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--green);letter-spacing:2px}\n.nav-back{font-size:12px;color:var(--t3);text-decoration:none;display:flex;align-items:center;gap:6px}\n.nav-back:hover{color:var(--t1)}\n.page{max-width:1100px;margin:0 auto;padding:32px 24px}\n.page-title{font-size:22px;font-weight:600;color:var(--white);margin-bottom:4px}\n.page-sub{font-size:13px;color:var(--t3);margin-bottom:32px}\n\n/* Summary cards */\n.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:32px}\n@media(max-width:700px){.summary{grid-template-columns:1fr 1fr}}\n.scard{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:16px}\n.scard-lbl{font-size:10px;color:var(--t3);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px}\n.scard-val{font-family:var(--mono);font-size:24px;font-weight:600;color:var(--white)}\n.scard-val.g{color:var(--green)}.scard-val.r{color:var(--red)}.scard-val.a{color:var(--amber)}\n.scard-sub{font-size:11px;color:var(--t4);margin-top:4px}\n\n/* Sections */\n.section{margin-bottom:32px}\n.section-title{font-size:13px;font-weight:600;color:var(--t2);letter-spacing:1px;text-transform:uppercase;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--b1)}\n.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}\n@media(max-width:700px){.grid2{grid-template-columns:1fr}}\n\n/* Table */\n.tbl-wrap{background:var(--s1);border:1px solid var(--b1);border-radius:8px;overflow:hidden}\n.tbl{width:100%;border-collapse:collapse;font-size:13px}\n.tbl th{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--t3);padding:10px 16px;text-align:left;border-bottom:1px solid var(--b1);font-weight:500}\n.tbl td{padding:11px 16px;border-bottom:1px solid rgba(28,37,54,.6);font-family:var(--mono)}\n.tbl tr:last-child td{border-bottom:none}\n.tbl tr:hover td{background:var(--s2)}\n.pos{color:var(--green)}.neg{color:var(--red)}.neu{color:var(--t3)}\n\n/* Bar chart */\n.bar-chart{display:flex;flex-direction:column;gap:8px}\n.bar-row{display:flex;align-items:center;gap:10px}\n.bar-label{font-size:11px;color:var(--t2);min-width:60px;font-family:var(--mono)}\n.bar-track{flex:1;height:8px;background:var(--s2);border-radius:4px;overflow:hidden}\n.bar-fill{height:100%;border-radius:4px;transition:width .6s}\n.bar-val{font-size:11px;font-family:var(--mono);min-width:50px;text-align:right}\n\n/* Recommendations */\n.rec-list{display:flex;flex-direction:column;gap:8px}\n.rec-item{background:var(--s1);border:1px solid var(--b1);border-left:3px solid var(--amber);border-radius:6px;padding:12px 14px;font-size:13px;color:var(--t1)}\n.rec-item.good{border-left-color:var(--green)}\n.rec-item.info{border-left-color:var(--blue)}\n\n/* Trade card */\n.trade-row{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--b1)}\n.trade-row:last-child{border-bottom:none}\n.trade-sym{font-family:var(--mono);font-weight:500;color:var(--white)}\n.trade-meta{font-size:11px;color:var(--t3);margin-top:2px}\n\n/* Loading / error */\n.loading{text-align:center;padding:60px;color:var(--t4);font-family:var(--mono);font-size:13px}\n.insufficient{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:40px;text-align:center;color:var(--t3);font-size:13px;line-height:1.8}\n</style>\n</head>\n<body>\n<nav class="nav">\n  <div class="nav-logo">⬡ FIRST-ORBIT PRO · ANALYTICS</div>\n  <a href="/" class="nav-back">← Dashboard</a>\n</nav>\n\n<div class="page">\n  <div class="page-title">Strategy Analytics</div>\n  <div class="page-sub">What the trade history is telling us — patterns, win rates, recommendations</div>\n\n  <div id="root"><div class="loading">Loading trade data...</div></div>\n</div>\n\n<script>\nasync function load() {\n  const root = document.getElementById(\'root\');\n  let d;\n  try {\n    const r = await fetch(\'/analytics\');\n    d = await r.json();\n  } catch(e) {\n    root.innerHTML = \'<div class="loading">Failed to load — is the bot running?</div>\';\n    return;\n  }\n\n  if (d.error) {\n    root.innerHTML = `<div class="insufficient">${d.error}</div>`;\n    return;\n  }\n\n  const s = d.summary;\n  const pf = s.profit_factor;\n\n  root.innerHTML = `\n    <!-- SUMMARY -->\n    <div class="summary">\n      <div class="scard">\n        <div class="scard-lbl">Total P&L</div>\n        <div class="scard-val ${s.total_pnl>=0?\'g\':\'r\'}">${s.total_pnl>=0?\'+\':\'\'}Rs.${Math.round(s.total_pnl).toLocaleString(\'en-IN\')}</div>\n        <div class="scard-sub">${s.total_trades} closed trades</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Win Rate</div>\n        <div class="scard-val ${s.win_rate>=50?\'g\':s.win_rate>=35?\'a\':\'r\'}">${s.win_rate}%</div>\n        <div class="scard-sub">need >40% to be profitable</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Expectancy</div>\n        <div class="scard-val ${s.expectancy>=0?\'g\':\'r\'}">${s.expectancy>=0?\'+\':\'\'}Rs.${s.expectancy}</div>\n        <div class="scard-sub">avg P&L per trade</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Profit Factor</div>\n        <div class="scard-val ${pf>=1.5?\'g\':pf>=1?\'a\':\'r\'}">${pf}×</div>\n        <div class="scard-sub">gross wins ÷ gross losses</div>\n      </div>\n    </div>\n\n    <!-- AVG WIN/LOSS -->\n    <div class="summary" style="grid-template-columns:1fr 1fr 1fr;margin-bottom:32px">\n      <div class="scard">\n        <div class="scard-lbl">Avg Win</div>\n        <div class="scard-val g">+Rs.${s.avg_win}</div>\n        <div class="scard-sub">per winning trade</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Avg Loss</div>\n        <div class="scard-val r">Rs.${s.avg_loss}</div>\n        <div class="scard-sub">per losing trade</div>\n      </div>\n      <div class="scard">\n        <div class="scard-lbl">Win:Loss Ratio</div>\n        <div class="scard-val ${s.avg_loss!==0&&Math.abs(s.avg_win/s.avg_loss)>=1.5?\'g\':\'a\'}">${s.avg_loss!==0?Math.abs(s.avg_win/s.avg_loss).toFixed(2):\'—\'}×</div>\n        <div class="scard-sub">target: 1.5×</div>\n      </div>\n    </div>\n\n    <div class="grid2">\n      <!-- WIN RATE BY SCORE -->\n      <div class="section">\n        <div class="section-title">Win Rate by Setup Score</div>\n        <div class="tbl-wrap">\n          <table class="tbl">\n            <thead><tr><th>Score</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th><th>Total</th></tr></thead>\n            <tbody>\n              ${Object.entries(d.by_score).map(([b,v])=>`\n                <tr>\n                  <td style="color:var(--white)">${b}</td>\n                  <td class="neu">${v.trades}</td>\n                  <td class="${v.win_rate>=50?\'pos\':v.win_rate>=35?\'\':\' neg\'}">${v.win_rate}%</td>\n                  <td class="${v.avg_pnl>=0?\'pos\':\'neg\'}">${v.avg_pnl>=0?\'+\':\'\'}Rs.${v.avg_pnl}</td>\n                  <td class="${v.total_pnl>=0?\'pos\':\'neg\'}">${v.total_pnl>=0?\'+\':\'\'}Rs.${v.total_pnl}</td>\n                </tr>`).join(\'\')}\n            </tbody>\n          </table>\n        </div>\n      </div>\n\n      <!-- WIN RATE BY DAYS HELD -->\n      <div class="section">\n        <div class="section-title">Win Rate by Days Held</div>\n        <div class="tbl-wrap">\n          <table class="tbl">\n            <thead><tr><th>Days</th><th>Trades</th><th>Win Rate</th><th>Avg P&L</th></tr></thead>\n            <tbody>\n              ${Object.entries(d.by_days_held).map(([b,v])=>`\n                <tr>\n                  <td style="color:var(--white)">${b===\'0\'?\'Same day\':b===\'1\'?\'1 day\':b+\' days\'}</td>\n                  <td class="neu">${v.trades}</td>\n                  <td class="${v.win_rate>=50?\'pos\':v.win_rate>=35?\'\':\' neg\'}">${v.win_rate}%</td>\n                  <td class="${v.avg_pnl>=0?\'pos\':\'neg\'}">${v.avg_pnl>=0?\'+\':\'\'}Rs.${v.avg_pnl}</td>\n                </tr>`).join(\'\')}\n            </tbody>\n          </table>\n        </div>\n      </div>\n    </div>\n\n    <!-- EXIT REASON BREAKDOWN -->\n    <div class="section">\n      <div class="section-title">Exit Signal Performance</div>\n      <div class="tbl-wrap">\n        <table class="tbl">\n          <thead><tr><th>Exit Reason</th><th>Wins</th><th>Losses</th><th>Total P&L</th><th>Assessment</th></tr></thead>\n          <tbody>\n            ${Object.entries(d.by_exit_reason).map(([reason, v])=>{\n              const total = v.wins + v.losses;\n              const wr = total ? Math.round(v.wins/total*100) : 0;\n              const assess = wr >= 60 ? \'✓ Working\' : wr >= 40 ? \'~ Neutral\' : \'✕ Review\';\n              const assessCls = wr >= 60 ? \'pos\' : wr >= 40 ? \'neu\' : \'neg\';\n              return `<tr>\n                <td style="color:var(--white)">${reason}</td>\n                <td class="pos">${v.wins}</td>\n                <td class="neg">${v.losses}</td>\n                <td class="${v.pnl>=0?\'pos\':\'neg\'}">${v.pnl>=0?\'+\':\'\'}Rs.${v.pnl}</td>\n                <td class="${assessCls}">${assess} (${wr}%)</td>\n              </tr>`;\n            }).join(\'\')}\n          </tbody>\n        </table>\n      </div>\n    </div>\n\n    <div class="grid2">\n      <!-- BEST TRADES -->\n      <div class="section">\n        <div class="section-title">Best Trades</div>\n        <div class="tbl-wrap">\n          ${d.best_trades.map(t=>`\n            <div class="trade-row">\n              <div>\n                <div class="trade-sym">${t.sym}</div>\n                <div class="trade-meta">${t.reason} · score ${t.score} · ${t.days}d</div>\n              </div>\n              <div class="pos">+Rs.${t.pnl.toLocaleString(\'en-IN\')}</div>\n            </div>`).join(\'\')}\n        </div>\n      </div>\n\n      <!-- WORST TRADES -->\n      <div class="section">\n        <div class="section-title">Worst Trades</div>\n        <div class="tbl-wrap">\n          ${[...d.worst_trades].reverse().map(t=>`\n            <div class="trade-row">\n              <div>\n                <div class="trade-sym">${t.sym}</div>\n                <div class="trade-meta">${t.reason} · score ${t.score} · ${t.days}d</div>\n              </div>\n              <div class="neg">Rs.${t.pnl.toLocaleString(\'en-IN\')}</div>\n            </div>`).join(\'\')}\n        </div>\n      </div>\n    </div>\n\n    <!-- RECOMMENDATIONS -->\n    <div class="section">\n      <div class="section-title">What the Data Suggests</div>\n      <div class="rec-list">\n        ${d.recommendations.map(r=>`<div class="rec-item">💡 ${r}</div>`).join(\'\')}\n      </div>\n      <div style="font-size:11px;color:var(--t4);margin-top:12px;padding:0 4px">\n        Recommendations require 20+ real strategy exits to be statistically meaningful. \n        Current count: ${s.total_trades} trades.\n      </div>\n    </div>\n  `;\n}\n\nload();\n</script>\n</body>\n</html>\n'
 
 
@@ -1521,6 +1574,10 @@ def start_dashboard():
     @app.route("/analytics")
     def analytics_page():
         return ANALYTICS_HTML
+
+    @app.route("/ledger")
+    def ledger_page():
+        return LEDGER_HTML
 
 
 
@@ -1592,6 +1649,59 @@ def start_dashboard():
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)})
+
+    @app.route("/api/ledger")
+    def api_ledger():
+        """Complete lifetime trade ledger with running P&L — full audit trail."""
+        try:
+            con2 = sqlite3.connect(DB_PATH)
+            rows = con2.execute(
+                "SELECT sym, direction, entry, qty, pnl, score, exit_reason, "
+                "status, opened_at, closed_at, days_held "
+                "FROM trades ORDER BY COALESCE(closed_at, opened_at) ASC"
+            ).fetchall()
+            con2.close()
+
+            ledger, running = [], 0.0
+            realised_total = wins = losses = 0
+            for r in rows:
+                sym, direction, entry, qty, pnl, score, reason, status, opened, closed, days = r
+                pnl = float(pnl or 0)
+                is_closed = status in ("win", "loss")
+                # Genuine realised trades only (exclude cancelled/excess/dup noise)
+                genuine = is_closed and reason and not any(
+                    x in reason for x in ("EXCESS", "CANCEL", "BOOT", "DUP")
+                )
+                if genuine:
+                    running += pnl
+                    realised_total += 1
+                    if pnl > 0: wins += 1
+                    else: losses += 1
+                ledger.append({
+                    "sym": sym, "direction": direction or "BUY",
+                    "entry": round(float(entry or 0), 2),
+                    "qty": int(qty or 0),
+                    "pnl": round(pnl, 2),
+                    "score": round(float(score or 0), 1),
+                    "exit_reason": reason or "",
+                    "status": status,
+                    "opened_at": opened, "closed_at": closed,
+                    "days_held": int(days or 0),
+                    "genuine": genuine,
+                    "running_pnl": round(running, 2) if genuine else None,
+                })
+            wr = round(wins / realised_total * 100, 1) if realised_total else 0
+            return jsonify({
+                "trades": ledger,
+                "summary": {
+                    "lifetime_pnl": round(running, 2),
+                    "realised_trades": realised_total,
+                    "wins": wins, "losses": losses, "win_rate": wr,
+                    "total_rows": len(ledger),
+                }
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 
     @app.route("/api/analytics")
@@ -1806,7 +1916,11 @@ def start_dashboard():
                     h = yf.Ticker(sym + ".NS").history(
                         period="1d", interval="1m", timeout=5, auto_adjust=True)
                     if h is not None and len(h) > 0:
-                        last_price = round(float(h["Close"].iloc[-1]), 2)
+                        lp = round(float(h["Close"].iloc[-1]), 2)
+                        if math.isfinite(lp):
+                            last_price = lp
+                        else:
+                            raise ValueError("nan price")
                     else:
                         raise ValueError("empty")
                 except Exception:
@@ -1814,7 +1928,7 @@ def start_dashboard():
                     cr = con.execute(
                         "SELECT price FROM screener_cache WHERE sym=?", (sym,)
                     ).fetchone()
-                    if cr and cr[0]:
+                    if cr and cr[0] and math.isfinite(float(cr[0])):
                         last_price = round(float(cr[0]), 2)
                 qty     = qty or 1
                 unreal  = round((last_price - entry) * qty, 2)
@@ -2029,6 +2143,27 @@ def run():
     if repaired:
         log.info(f"  Repaired {repaired} trades with NULL qty")
 
+    # Dedupe: if multiple OPEN rows exist for the same symbol (race condition in
+    # an earlier build), keep the most recent and cancel the rest. This is what
+    # caused a symbol to be "sold multiple times" — each duplicate row sold itself.
+    dupes = con.execute(
+        "SELECT sym, COUNT(*) c FROM trades WHERE status='open' "
+        "GROUP BY sym HAVING c > 1"
+    ).fetchall()
+    for sym, cnt in dupes:
+        ids = [r[0] for r in con.execute(
+            "SELECT id FROM trades WHERE sym=? AND status='open' ORDER BY opened_at DESC",
+            (sym,)
+        ).fetchall()]
+        keep, drop = ids[0], ids[1:]
+        for tid in drop:
+            con.execute(
+                "UPDATE trades SET status='loss',pnl=0,closed_at=?,exit_reason='DUP_CANCELLED' WHERE id=?",
+                (datetime.now().isoformat(), tid)
+            )
+        log.warning(f"  Deduped {sym}: kept 1, cancelled {len(drop)} duplicate open row(s)")
+    con.commit()
+
     # Enforce MAX_OPEN on boot — keep top N by score, cancel rest with real P&L
     open_rows = con.execute(
         "SELECT id,sym,score,entry,qty FROM trades WHERE status='open' ORDER BY score DESC"
@@ -2071,9 +2206,14 @@ def run():
         if fixed:
             log.info(f"  Repaired {fixed} NULL qty trades")
 
-        # Manage open positions
-        log.info("-- Position management")
-        manage_positions(con)
+        # Manage open positions — ONLY when market is open. No trading of any
+        # kind after hours (after-hours prices are stale/nan and must never
+        # trigger an exit or any order).
+        if is_market_open():
+            log.info("-- Position management")
+            manage_positions(con)
+        else:
+            log.info("-- Market closed — no position management, no trading")
 
         # Check capacity and market hours
         stats    = get_stats(con)
