@@ -1675,57 +1675,6 @@ def start_dashboard():
         except Exception as e:
             return jsonify({"error": str(e)})
 
-    @app.route("/debug/reopen/<sym>")
-    def debug_reopen(sym):
-        """One-shot: clean up bogus duplicate closes for a symbol and recreate
-        ONE open position. Params: entry, qty, sl, target (query string).
-        Example: /debug/reopen/GLAND?entry=2248&qty=4&sl=2082.31&target=2496.53
-        Remove this route after use."""
-        from flask import request
-        sym = sym.upper()
-        try:
-            entry  = float(request.args.get("entry", 0))
-            qty    = int(request.args.get("qty", 0))
-            sl     = float(request.args.get("sl", 0))
-            target = float(request.args.get("target", 0))
-            if not (entry > 0 and qty > 0 and sl > 0 and target > 0):
-                return jsonify({"error": "need entry, qty, sl, target as positive query params"}), 400
-
-            con2 = sqlite3.connect(DB_PATH)
-            # 1. Don't create a duplicate — bail if an open row already exists
-            if con2.execute("SELECT 1 FROM trades WHERE sym=? AND status='open'", (sym,)).fetchone():
-                con2.close()
-                return jsonify({"error": f"{sym} already has an open position — nothing to do"}), 400
-
-            # 2. Purge the bogus duplicate closes (the after-hours DAILY_RSI sells)
-            #    so they don't pollute the lifetime ledger.
-            deleted = con2.execute(
-                "DELETE FROM trades WHERE sym=? AND status IN ('win','loss')", (sym,)
-            ).rowcount
-
-            # 3. Recreate ONE clean open position
-            rr = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)
-            risk_amt = round(qty * abs(entry - sl), 2)
-            con2.execute("""
-                INSERT INTO trades
-                (id,sym,direction,entry,sl,target,qty,risk_amt,target_gain,rr,score,
-                 status,pnl,days_held,opened_at,exit_reason)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,'open',0,0,?,?)
-            """, (f"{sym}_{int(time.time())}", sym, "BUY",
-                  entry, sl, target, qty, risk_amt,
-                  round(qty * abs(entry - target), 2),
-                  rr, 0, datetime.now().isoformat(), ""))
-            con2.commit()
-            con2.close()
-            return jsonify({
-                "ok": True, "sym": sym,
-                "deleted_bogus_closes": deleted,
-                "reopened": {"entry": entry, "qty": qty, "sl": sl, "target": target},
-                "note": "Remove this route after use."
-            })
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
     @app.route("/api/ledger")
     def api_ledger():
         """Complete lifetime trade ledger with running P&L — full audit trail."""
