@@ -72,8 +72,7 @@ MIN_MCAP_CR      = 20_000      # Rs. Crores
 
 # Strategy parameters
 RSI_PERIOD       = 14
-WEEKLY_RSI_MIN   = 60          # entry: weekly RSI floor
-WEEKLY_RSI_MAX   = 999         # entry: weekly RSI ceiling (none — trend can be strong)
+WEEKLY_RSI_MIN   = 60          # entry: weekly RSI floor (clean > 60, no ceiling)
 DAILY_RSI_MIN    = 57          # entry: daily RSI floor
 DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
 DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
@@ -424,8 +423,6 @@ def screen(sym, cache_cutoff, con):
                         wrsi_val = weekly_rsi(sym)
                         if wrsi_val < WEEKLY_RSI_MIN:
                             reject = f"weekly_rsi_low({wrsi_val:.0f})"
-                        elif wrsi_val > WEEKLY_RSI_MAX:
-                            pass  # no weekly ceiling — strong trend is fine
                         else:
                             # Quality filter 1: RSI 3-day trend check
                             # Not a hard "must be rising" — allows healthy consolidation
@@ -441,9 +438,18 @@ def screen(sym, cache_cutoff, con):
                             elif rsi_3d_trend < -4:
                                 # Falling for 3 days — trend weakening
                                 reject = f"rsi_3d_falling({drsi_val:.0f},{rsi_3d_trend:.1f}pts)"
-                            # Quality filter 2: price above 20-day EMA (uptrend only)
-                            elif price < float(pd.Series(c).ewm(span=20, adjust=False).mean().iloc[-1]) * 0.98:
-                                reject = "below_ema20"
+                            # Quality filter 2: TRIPLE EMA STACK — momentum alignment.
+                            # Requires EMA9 > EMA21 > EMA50 AND price above the stack.
+                            # Confirms short/mid/long momentum aligned (clean uptrend),
+                            # filtering choppy setups RSI alone would admit.
+                            elif not (
+                                float(pd.Series(c).ewm(span=9,  adjust=False).mean().iloc[-1]) >
+                                float(pd.Series(c).ewm(span=21, adjust=False).mean().iloc[-1]) >
+                                float(pd.Series(c).ewm(span=50, adjust=False).mean().iloc[-1])
+                            ):
+                                reject = "ema_not_stacked"
+                            elif price < float(pd.Series(c).ewm(span=9, adjust=False).mean().iloc[-1]) * 0.99:
+                                reject = "below_ema_stack"
                             # Quality filter 3: not in last 5% of ATR move (not stretched)
                             else:
                                 atr_val = atr(h, lo, c, ATR_PERIOD)
@@ -472,21 +478,25 @@ def screen(sym, cache_cutoff, con):
                                         # rsi_3d_trend already defined above in same scope
                                         rsi_bonus = 2.0 if rsi_3d_trend > 1 else (0.0 if rsi_3d_trend >= -1 else -1.0)
                                         score = round(rsi_score + mcap_score + rsi_bonus, 1)
-                            con.execute("""
-                                INSERT OR REPLACE INTO screener_cache
-                                (sym,price,daily_rsi,weekly_rsi,atr,score,
-                                 entry,sl,target,reject,updated_at)
-                                VALUES (?,?,?,?,?,?,?,?,?,NULL,?)
-                            """, (sym, price, round(drsi_val, 1), round(wrsi_val, 1),
-                                  round(atr_val, 2), score, entry, sl, target, now))
-                            con.commit()
-                            return {"sym": sym, "price": price,
-                                    "daily_rsi": round(drsi_val, 1),
-                                    "weekly_rsi": round(wrsi_val, 1),
-                                    "atr": round(atr_val, 2), "score": score,
-                                    "entry": entry, "sl": sl, "target": target,
-                                    "rr": round(ATR_TARGET_MULT / ATR_STOP_MULT, 2),
-                                    "mcap_cr": round(mcap, 0)}, None
+                            # Only cache+return a setup if NO reject fired in the chain
+                            # above. Deep rejects (rsi_sharp_drop, ema_not_stacked, etc.)
+                            # leave atr_val/entry/score unset, so guard before using them.
+                            if not reject:
+                                con.execute("""
+                                    INSERT OR REPLACE INTO screener_cache
+                                    (sym,price,daily_rsi,weekly_rsi,atr,score,
+                                     entry,sl,target,reject,updated_at)
+                                    VALUES (?,?,?,?,?,?,?,?,?,NULL,?)
+                                """, (sym, price, round(drsi_val, 1), round(wrsi_val, 1),
+                                      round(atr_val, 2), score, entry, sl, target, now))
+                                con.commit()
+                                return {"sym": sym, "price": price,
+                                        "daily_rsi": round(drsi_val, 1),
+                                        "weekly_rsi": round(wrsi_val, 1),
+                                        "atr": round(atr_val, 2), "score": score,
+                                        "entry": entry, "sl": sl, "target": target,
+                                        "rr": round(ATR_TARGET_MULT / ATR_STOP_MULT, 2),
+                                        "mcap_cr": round(mcap, 0)}, None
     except Exception as e:
         reject = f"error"
 
@@ -627,12 +637,12 @@ def quick_replace(con, slots_needed):
         WHERE entry IS NOT NULL
           AND updated_at > ?
           AND daily_rsi  BETWEEN ? AND ?
-          AND weekly_rsi BETWEEN ? AND ?
+          AND weekly_rsi >= ?
           AND sym NOT IN (SELECT sym FROM trades WHERE status='open')
         ORDER BY score DESC
         LIMIT ?
     """, (cache_cutoff, DAILY_RSI_MIN, DAILY_RSI_MAX,
-          WEEKLY_RSI_MIN, WEEKLY_RSI_MAX, slots_needed * 3)).fetchall()
+          WEEKLY_RSI_MIN, slots_needed * 3)).fetchall()
 
     if not rows:
         log.info("  Quick replace: no valid cache entries — doing full scan")
