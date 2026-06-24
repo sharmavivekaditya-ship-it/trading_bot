@@ -2,13 +2,15 @@
 First-Orbit Trader PRO — NSE Swing Trading Bot
 Pure algorithmic, no AI API required.
 
-STRATEGY : Dual RSI Momentum + Market Cap Filter
-ENTRY    : Weekly RSI(14) > 60 AND Daily RSI(14) > 60 AND MCap > Rs.20,000 Cr
-STOP     : Entry - 2.0 x ATR(14)
-TARGET   : Entry + 3.0 x ATR(14)
-EXIT     : Daily RSI < 50  |  Weekly RSI < 55  |  Bearish divergence (min 2 days)  |  Hard stop
+STRATEGY : Dual RSI Momentum + EMA Stack + ADX Trend Strength
+ENTRY    : Weekly RSI(14) > 60  AND  Daily RSI(14) 57-67  AND  MCap > Rs.20,000 Cr
+           AND  EMA9 > EMA21 > EMA50 (price above stack)  AND  ADX(14) > 20
+STOP     : Entry - 1.0 x ATR(14)
+TARGET   : Entry + 2.0 x ATR(14)    (R:R 2.0, break-even 33%)
+EXIT     : Daily RSI < 52  |  Weekly RSI < 52  |  Bearish divergence (min 2 days)  |  Hard stop
 SIZE     : qty = Rs.800 / (entry - stop)
 SCAN     : Two-pass — collect ALL setups across Nifty 500, rank by score, trade TOP 5 only
+HOLD     : Swing — carry across days, no intraday square-off
 UNIVERSE : Nifty 500 (covers ~95% of NSE market cap)
 """
 
@@ -78,8 +80,9 @@ DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
 DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
 WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
-ATR_STOP_MULT    = 2.0         # stop  = entry - 2.0*ATR (swing, survives gaps)
-ATR_TARGET_MULT  = 3.0         # target = entry + 3.0*ATR  → R:R 1.5 (swing)
+ATR_STOP_MULT    = 1.0         # stop  = entry - 1.0*ATR
+ATR_TARGET_MULT  = 2.0         # target = entry + 2.0*ATR  → R:R 2.0
+MIN_ADX          = 20.0        # entry: min trend strength (ADX) — real momentum
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
 
@@ -344,6 +347,30 @@ def atr(high, low, close, period=14):
     tr = np.maximum(h - l, np.maximum(np.abs(h - c), np.abs(l - c)))
     return float(tr[-period:].mean())
 
+def adx(high, low, close, period=14):
+    """Average Directional Index — measures trend STRENGTH (not direction).
+    ADX > 20-25 = trending; < 20 = weak/choppy. Used to filter for stocks
+    with enough momentum to actually travel to a target."""
+    try:
+        h, l, c = np.asarray(high, float), np.asarray(low, float), np.asarray(close, float)
+        if len(h) < period * 2:
+            return 0.0
+        up   = h[1:] - h[:-1]
+        down = l[:-1] - l[1:]
+        plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
+        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+        tr = np.maximum(h[1:] - l[1:],
+                        np.maximum(np.abs(h[1:] - c[:-1]), np.abs(l[1:] - c[:-1])))
+        # Wilder smoothing via simple rolling mean (good enough for a gate)
+        atr_s = pd.Series(tr).rolling(period).mean()
+        plus_di  = 100 * pd.Series(plus_dm).rolling(period).mean()  / atr_s
+        minus_di = 100 * pd.Series(minus_dm).rolling(period).mean() / atr_s
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx_val = dx.rolling(period).mean().iloc[-1]
+        return float(adx_val) if pd.notna(adx_val) else 0.0
+    except Exception:
+        return 0.0
+
 def get_mcap(sym):
     try:
         return (getattr(yf.Ticker(sym + ".NS").fast_info, "market_cap", None) or 0) / 1e7
@@ -450,6 +477,10 @@ def screen(sym, cache_cutoff, con):
                                 reject = "ema_not_stacked"
                             elif price < float(pd.Series(c).ewm(span=9, adjust=False).mean().iloc[-1]) * 0.99:
                                 reject = "below_ema_stack"
+                            # Quality filter 2b: ADX trend strength — must be a real
+                            # trend with momentum to travel to target, not a weak drift.
+                            elif adx(h, lo, c, ATR_PERIOD) < MIN_ADX:
+                                reject = f"weak_trend_adx({adx(h, lo, c, ATR_PERIOD):.0f})"
                             # Quality filter 3: not in last 5% of ATR move (not stretched)
                             else:
                                 atr_val = atr(h, lo, c, ATR_PERIOD)
@@ -1149,7 +1180,8 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <span class="sc">Weekly RSI &gt; 60</span>
   <span class="sc">Daily RSI 57–67</span>
   <span class="sc">MCap &gt; Rs.20,000 Cr</span>
-  <span class="sc">TGT 3×ATR · Stop 2×ATR</span>
+  <span class="sc">EMA 9&gt;21&gt;50 · ADX&gt;20</span>
+  <span class="sc">TGT 2×ATR · Stop 1×ATR</span>
   <span class="sc">Exit: RSI fade · Divergence</span>
   <span class="sc">Top 5 · Nifty 500</span>
 </div>
