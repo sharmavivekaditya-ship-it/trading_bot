@@ -52,10 +52,19 @@ FALLBACK_UNIVERSE = [
 
 def get_universe():
     try:
+        import ssl
+        # macOS Python often lacks a cert bundle → NSE fetch fails with
+        # CERTIFICATE_VERIFY_FAILED. Try certifi; if absent, fall back to an
+        # unverified context (this is a public CSV, no sensitive data).
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = ssl._create_unverified_context()
         req = urllib.request.Request(
             NIFTY500_URL,
             headers={"User-Agent": "Mozilla/5.0", "Referer": "https://nseindia.com"})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
             df = pd.read_csv(io.StringIO(r.read().decode("latin-1")))
         col = next(c for c in df.columns if "symbol" in c.lower())
         syms = [s for s in df[col].dropna().str.strip()

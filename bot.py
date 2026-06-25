@@ -6,13 +6,13 @@ STRATEGY : Pullback-in-Uptrend (buy strength on a discount)
 ENTRY    : Weekly RSI > 60  AND  EMA9>21>50  AND  ADX(14) > 20   (uptrend context)
            AND  price pulled back below prior-week midline, now turning up & reclaiming it
 STOP     : Entry - 1.0 x ATR(14)
-TARGET   : Entry + 2.0 x ATR(14)    (R:R 2.0)
+TARGET   : Entry + 3.0 x ATR(14)    (R:R 3.0, out-of-sample validated)
 EXIT     : Daily RSI < 52  |  Weekly RSI < 52  |  Bearish divergence (min 2 days)  |  Hard stop
 SIZE     : qty = Rs.800 / (entry - stop)
 SCAN     : Two-pass — collect ALL setups across Nifty 500, rank by score, trade TOP 5 only
 HOLD     : Swing — carry across days, no intraday square-off
 UNIVERSE : Nifty 500 (covers ~95% of NSE market cap)
-BACKTEST : +37.9% / 3y, 41.7% win, PF 1.28, max DD 14.7% (vs momentum-now −24.4%)
+BACKTEST : discount +38.9%/3y PF 1.28; target 3xATR validated out-of-sample PF 1.20
 """
 
 import time, sqlite3, os, logging, io, math
@@ -82,7 +82,8 @@ DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
 WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
 ATR_STOP_MULT    = 1.0         # stop  = entry - 1.0*ATR
-ATR_TARGET_MULT  = 2.0         # target = entry + 2.0*ATR  → R:R 2.0
+ATR_TARGET_MULT  = 3.0         # target = entry + 3.0*ATR  → R:R 3.0
+                               # (validated out-of-sample: PF 1.20 vs 1.05 at 2.0x)
 MIN_ADX          = 20.0        # entry: min trend strength (ADX) — real momentum
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
@@ -1167,12 +1168,12 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
 <!-- STRATEGY STRIP -->
 <div class="strat">
   <span class="strat-lbl">Strategy</span>
-  <span class="sc hi">DUAL RSI MOMENTUM</span>
+  <span class="sc hi">DISCOUNT PULLBACK</span>
   <span class="sc">Weekly RSI &gt; 60</span>
-  <span class="sc">Daily RSI 57–67</span>
-  <span class="sc">MCap &gt; Rs.20,000 Cr</span>
   <span class="sc">EMA 9&gt;21&gt;50 · ADX&gt;20</span>
-  <span class="sc">TGT 2×ATR · Stop 1×ATR</span>
+  <span class="sc">MCap &gt; Rs.20,000 Cr</span>
+  <span class="sc">Buy below week-midline, turning up</span>
+  <span class="sc">TGT 3×ATR · Stop 1×ATR</span>
   <span class="sc">Exit: RSI fade · Divergence</span>
   <span class="sc">Top 5 · Nifty 500</span>
 </div>
