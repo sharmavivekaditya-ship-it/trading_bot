@@ -677,6 +677,13 @@ def quick_replace(con, slots_needed):
     risk_used = float(stats_row[0]) if stats_row else 0.0
     risk_left = MAX_WEEKLY_RISK - risk_used
 
+    # How much cash is actually free to deploy (never deploy more than we have).
+    realised = get_stats(con).get("pnl", 0)
+    deployed = con.execute(
+        "SELECT COALESCE(SUM(entry*qty),0) FROM trades WHERE status='open'"
+    ).fetchone()[0] or 0
+    free_cash = CAPITAL + realised - deployed
+
     placed = 0
     for sym, score, entry, sl, target, drsi, wrsi in rows:
         cur_open = con.execute("SELECT COUNT(*) FROM trades WHERE status='open'").fetchone()[0]
@@ -690,9 +697,16 @@ def quick_replace(con, slots_needed):
             (sym, date.today().isoformat())
         ).fetchone():
             continue
+        rp = entry - sl                      # risk per share (per symbol)
         if rp <= 0:
             continue
-        qty         = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
+        qty = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
+        # Cash guard: never deploy more capital than is free. Shrink qty to fit;
+        # if we can't afford even 1 share, skip this symbol.
+        if qty * entry > free_cash:
+            qty = int(free_cash / entry)
+        if qty < 1:
+            continue
         actual_risk = round(qty * rp, 2)
         rr          = round(ATR_TARGET_MULT / ATR_STOP_MULT, 2)
         # Route through broker — paper simulates, live places real Kite order
@@ -715,6 +729,7 @@ def quick_replace(con, slots_needed):
             log.warning(f"  {sym}: already has an open position — skipping duplicate buy")
             continue
         risk_left -= actual_risk
+        free_cash -= qty * entry
         placed    += 1
         log.info(f"  INSTANT BUY {sym}  qty:{qty}  @ Rs.{entry}"
                  f"  SL:Rs.{sl}  TGT:Rs.{target}  wRSI:{wrsi}  dRSI:{drsi}  score:{score}")
@@ -779,6 +794,13 @@ def scan_and_trade(universe, con):
     risk_used = float(stats_row[0]) if stats_row else 0.0
     risk_left = MAX_WEEKLY_RISK - risk_used
 
+    # Cash budget — never deploy more capital than is free.
+    realised = get_stats(con).get("pnl", 0)
+    deployed = con.execute(
+        "SELECT COALESCE(SUM(entry*qty),0) FROM trades WHERE status='open'"
+    ).fetchone()[0] or 0
+    free_cash = CAPITAL + realised - deployed
+
     placed = 0
     for s in top:
         cur_open = con.execute(
@@ -807,6 +829,12 @@ def scan_and_trade(universe, con):
         if rp <= 0:
             continue
         qty = max(1, int(min(risk_left, RISK_PER_TRADE) / rp))
+        # Cash guard: never deploy more than free cash. Shrink to fit, else skip.
+        if qty * s["entry"] > free_cash:
+            qty = int(free_cash / s["entry"])
+        if qty < 1:
+            log.info(f"  SKIP {s['sym']} — insufficient free cash (Rs.{free_cash:.0f})")
+            continue
         actual_risk = round(qty * rp, 2)
         # Route through broker — paper simulates, live places real Kite order
         fill = broker.place_buy(s["sym"], qty, s["entry"])
@@ -833,6 +861,7 @@ def scan_and_trade(universe, con):
             log.warning(f"  {s['sym']}: already has an open position — skipping duplicate buy")
             continue
         risk_left -= actual_risk
+        free_cash -= qty * s["entry"]
         placed    += 1
         log.info(
             f"  BUY {s['sym']}  qty:{qty}  @ Rs.{s['entry']}"
