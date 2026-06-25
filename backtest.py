@@ -157,20 +157,31 @@ def fetch(sym):
         return None
 
 
+def _align_rsi(values, idx, df_index):
+    """Build an RSI series aligned to df_index, safe when rsi_series returns
+    fewer points than the index (recent listings with little history)."""
+    r = rsi_series(values, 14)
+    if not r or len(r) == 0:
+        # Not enough data for RSI — return all-NaN aligned to daily index
+        return pd.Series(np.nan, index=df_index)
+    # rsi_series may be shorter/longer than idx; trim/pad to match idx length
+    if len(r) < len(idx):
+        r = [np.nan] * (len(idx) - len(r)) + list(r)
+    elif len(r) > len(idx):
+        r = r[-len(idx):]
+    s = pd.Series(r, index=idx)
+    return s.reindex(df_index, method="ffill")
+
+
 def weekly_rsi_aligned(df):
-    """Weekly RSI resampled, forward-filled to daily index (no look-ahead:
-    uses only completed weeks)."""
+    """Weekly RSI resampled, forward-filled to daily index (completed weeks)."""
     wk = df["Close"].resample("W").last().dropna()
-    wr = rsi_series(wk.values, 14)
-    wk_rsi = pd.Series(wr, index=wk.index)
-    return wk_rsi.reindex(df.index, method="ffill")
+    return _align_rsi(wk.values, wk.index, df.index)
 
 
 def monthly_rsi_aligned(df):
     mo = df["Close"].resample("ME").last().dropna()
-    mr = rsi_series(mo.values, 14)
-    mo_rsi = pd.Series(mr, index=mo.index)
-    return mo_rsi.reindex(df.index, method="ffill")
+    return _align_rsi(mo.values, mo.index, df.index)
 
 
 # ── BACKTEST ENGINES ──────────────────────────────────────────────────────────
