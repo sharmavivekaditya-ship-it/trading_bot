@@ -29,28 +29,17 @@ except Exception:
     SESSION = None
 import yfinance as yf
 
-# ── STRATEGY CONFIG (mirrors bot.py exactly) ──────────────────────────────────
-WEEKLY_RSI_MIN  = 60
-DAILY_RSI_MIN   = 57
-DAILY_RSI_MAX   = 67
-MIN_ADX         = 20.0
-ATR_PERIOD      = 14
-ATR_STOP_MULT   = 1.0
-ATR_TARGET_MULT = 2.0
-DAILY_RSI_EXIT  = 52
-WEEKLY_RSI_EXIT = 52
-MIN_DAYS_DIV    = 2
-RISK_PER_TRADE  = 800
-MAX_OPEN        = 5
-CAPITAL         = 100_000
-
+# ── COSTS ─────────────────────────────────────────────────────────────────────
 # Costs — realistic NSE delivery round-trip (brokerage + STT + charges + slippage)
 COST_PCT        = 0.0015   # ~0.15% per side ≈ 0.3% round trip (conservative)
 
-# Backtest window & universe
+# Backtest window
 YEARS           = 3
-# A representative slice of liquid Nifty large/mid caps. Expand as you like.
-UNIVERSE = [
+
+# ── UNIVERSE: full Nifty 500, fetched live from NSE (same source as bot.py) ────
+import io, urllib.request
+NIFTY500_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+FALLBACK_UNIVERSE = [
     "RELIANCE","TCS","HDFCBANK","INFY","ICICIBANK","HINDUNILVR","ITC","SBIN",
     "BHARTIARTL","KOTAKBANK","LT","AXISBANK","ASIANPAINT","MARUTI","TITAN",
     "SUNPHARMA","ULTRACEMCO","WIPRO","NESTLEIND","BAJFINANCE","HCLTECH","NTPC",
@@ -60,6 +49,39 @@ UNIVERSE = [
     "MOTHERSON","KPRMILL","LAURUSLABS","TATACOMM","APOLLOHOSP","ZYDUSLIFE",
     "TORNTPHARM","SAILIFE","CGPOWER","KIMS","ACMESOLAR","TATATECH","EXIDEIND",
 ]
+
+def get_universe():
+    try:
+        req = urllib.request.Request(
+            NIFTY500_URL,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://nseindia.com"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            df = pd.read_csv(io.StringIO(r.read().decode("latin-1")))
+        col = next(c for c in df.columns if "symbol" in c.lower())
+        syms = [s for s in df[col].dropna().str.strip()
+                if s and not s.upper().startswith("DUMMY") and len(s) <= 20]
+        print(f"Universe: {len(syms)} Nifty 500 symbols (live from NSE)")
+        return syms
+    except Exception as e:
+        print(f"NSE fetch failed ({e}) — using {len(FALLBACK_UNIVERSE)}-stock fallback")
+        return FALLBACK_UNIVERSE
+
+
+# ── STRATEGY PARAMETERS (defaults; grid search overrides these) ───────────────
+# Bundled in a dict so the optimizer can swap them cleanly.
+DEFAULT_PARAMS = {
+    "MIN_ADX":         20.0,
+    "ATR_STOP_MULT":   1.0,
+    "ATR_TARGET_MULT": 2.0,
+    "WEEKLY_RSI_MIN":  60,
+    "DAILY_RSI_EXIT":  52,
+    "WEEKLY_RSI_EXIT": 52,
+}
+ATR_PERIOD     = 14
+MIN_DAYS_DIV   = 2
+RISK_PER_TRADE = 800
+MAX_OPEN       = 5
+CAPITAL        = 100_000
 
 
 # ── INDICATORS (identical to bot.py) ──────────────────────────────────────────
@@ -143,45 +165,39 @@ def monthly_rsi_aligned(df):
 
 
 # ── BACKTEST ENGINES ──────────────────────────────────────────────────────────
-def backtest_strategy(data, strategy="full"):
+def backtest_strategy(data, ind, strategy="discount", params=None,
+                      date_from=None, date_to=None):
     """
-    Walk every trading day across the whole universe. Portfolio-level:
-    max MAX_OPEN concurrent positions, picked by score when multiple qualify.
-    strategy='full'  → exact bot.py logic
-    strategy='rsi'   → simple Daily+Weekly+Monthly RSI>60 buy, same exits
+    Walk every trading day. Portfolio-level: max MAX_OPEN concurrent positions.
+    strategy='discount' → buy strength on prior-week-midline pullback + resumption
+    strategy='rsi'      → simple Daily+Weekly+Monthly RSI>60 baseline
+    params: dict overriding strategy thresholds (for grid search)
+    date_from/date_to: restrict the trading window (for in/out-of-sample split)
+    `ind` is the precomputed-indicator dict (built once, reused across grid runs).
     """
-    # Build a unified date index
-    all_dates = sorted(set().union(*[set(df.index) for df in data.values()]))
-    open_pos = {}          # sym -> dict
-    closed = []            # list of trade dicts
-    equity = CAPITAL
-    equity_curve = []
+    P = params or DEFAULT_PARAMS
+    MIN_ADX_P    = P["MIN_ADX"]
+    STOP_P       = P["ATR_STOP_MULT"]
+    TGT_P        = P["ATR_TARGET_MULT"]
+    WK_MIN_P     = P["WEEKLY_RSI_MIN"]
+    D_EXIT_P     = P["DAILY_RSI_EXIT"]
+    W_EXIT_P     = P["WEEKLY_RSI_EXIT"]
 
-    # Precompute indicators per symbol
-    ind = {}
-    for sym, df in data.items():
-        c = df["Close"].values; h = df["High"].values; l = df["Low"].values
-        ind[sym] = {
-            "close": c, "high": h, "low": l,
-            "drsi": rsi_series(c, 14),
-            "wrsi": weekly_rsi_aligned(df),
-            "mrsi": monthly_rsi_aligned(df),
-            "idx": {d: k for k, d in enumerate(df.index)},
-        }
+    all_dates = sorted(set().union(*[set(df.index) for df in data.values()]))
+    if date_from: all_dates = [d for d in all_dates if d >= date_from]
+    if date_to:   all_dates = [d for d in all_dates if d <= date_to]
+
+    open_pos, closed, equity, equity_curve = {}, [], CAPITAL, []
 
     for date in all_dates:
-        # 1) Manage open positions (exits) — check stop/target/RSI fade
+        # 1) Manage open positions (exits)
         for sym in list(open_pos.keys()):
             if date not in ind[sym]["idx"]:
                 continue
             i = ind[sym]["idx"][date]
             p = open_pos[sym]
-            px = ind[sym]["close"][i]
-            hi = ind[sym]["high"][i]; lo = ind[sym]["low"][i]
-            days_held = p["days"]
-            reason = None
-            # Intrabar: stop and target. Conservative — if both touched same day,
-            # assume stop hit first (worst case).
+            px = ind[sym]["close"][i]; hi = ind[sym]["high"][i]; lo = ind[sym]["low"][i]
+            days_held = p["days"]; reason = None
             if lo <= p["sl"]:
                 reason, exit_px = "HARD_STOP", p["sl"]
             elif hi >= p["target"]:
@@ -189,9 +205,9 @@ def backtest_strategy(data, strategy="full"):
             else:
                 dr = ind[sym]["drsi"][i] if i < len(ind[sym]["drsi"]) else np.nan
                 wr = ind[sym]["wrsi"].iloc[i] if i < len(ind[sym]["wrsi"]) else np.nan
-                if days_held >= 1 and not np.isnan(dr) and dr < DAILY_RSI_EXIT:
+                if days_held >= 1 and not np.isnan(dr) and dr < D_EXIT_P:
                     reason, exit_px = "DAILY_RSI", px
-                elif days_held >= 1 and not np.isnan(wr) and 0 < wr < WEEKLY_RSI_EXIT:
+                elif days_held >= 1 and not np.isnan(wr) and 0 < wr < W_EXIT_P:
                     reason, exit_px = "WEEKLY_RSI", px
             if reason:
                 gross = (exit_px - p["entry"]) * p["qty"]
@@ -205,7 +221,7 @@ def backtest_strategy(data, strategy="full"):
             else:
                 p["days"] += 1
 
-        # 2) Look for entries if slots open
+        # 2) Entries
         slots = MAX_OPEN - len(open_pos)
         if slots > 0:
             candidates = []
@@ -213,45 +229,41 @@ def backtest_strategy(data, strategy="full"):
                 if sym in open_pos or date not in ind[sym]["idx"]:
                     continue
                 i = ind[sym]["idx"][date]
-                if i < 60:   # need history for EMA50/ADX
+                if i < 60:
                     continue
                 c = ind[sym]["close"]; h = ind[sym]["high"]; l = ind[sym]["low"]
                 drsi = ind[sym]["drsi"][i] if i < len(ind[sym]["drsi"]) else np.nan
-                wrsi = ind[sym]["wrsi"].iloc[i]
-                mrsi = ind[sym]["mrsi"].iloc[i]
+                wrsi = ind[sym]["wrsi"].iloc[i]; mrsi = ind[sym]["mrsi"].iloc[i]
                 price = c[i]
                 if np.isnan(drsi) or np.isnan(wrsi):
                     continue
 
-                if strategy == "full":
-                    # Exact bot.py entry gates
-                    if wrsi < WEEKLY_RSI_MIN: continue
-                    if not (DAILY_RSI_MIN <= drsi <= DAILY_RSI_MAX): continue
+                if strategy == "discount":
+                    if wrsi < WK_MIN_P: continue
                     e9, e21, e50 = ema_at(c, 9, i), ema_at(c, 21, i), ema_at(c, 50, i)
                     if not (e9 > e21 > e50): continue
-                    if price < e9 * 0.99: continue
-                    if adx_at(h, l, c, i, ATR_PERIOD) < MIN_ADX: continue
+                    if adx_at(h, l, c, i, ATR_PERIOD) < MIN_ADX_P: continue
+                    mid = ind[sym]["midline"].iloc[i]
+                    if np.isnan(mid): continue
+                    prev_close = c[i-1]
+                    if not (prev_close < mid and price > prev_close and price >= mid):
+                        continue
                     atr_val = atr_at(h, l, c, i, ATR_PERIOD)
                     if not atr_val or atr_val <= 0: continue
-                    # Score (mirrors bot.py bell-curve)
-                    w_q = max(0, 5 - abs(wrsi - 62)) / 5
-                    d_q = max(0, 5 - abs(drsi - 62)) / 5
-                    score = (w_q + d_q) * 10
+                    score = adx_at(h, l, c, i, ATR_PERIOD)
                     candidates.append((score, sym, i, price, atr_val))
-                else:  # simple RSI baseline
+                else:  # rsi baseline
                     if np.isnan(mrsi): continue
                     if drsi > 60 and wrsi > 60 and mrsi > 60:
                         atr_val = atr_at(h, l, c, i, ATR_PERIOD)
                         if not atr_val or atr_val <= 0: continue
-                        score = drsi  # rank by daily RSI
-                        candidates.append((score, sym, i, price, atr_val))
+                        candidates.append((drsi, sym, i, price, atr_val))
 
             candidates.sort(reverse=True)
             for score, sym, i, price, atr_val in candidates[:slots]:
-                sl = price - ATR_STOP_MULT * atr_val
-                target = price + ATR_TARGET_MULT * atr_val
-                rp = price - sl
-                qty = max(1, int(RISK_PER_TRADE / rp))
+                sl = price - STOP_P * atr_val
+                target = price + TGT_P * atr_val
+                qty = max(1, int(RISK_PER_TRADE / (price - sl)))
                 open_pos[sym] = {"entry": price, "sl": sl, "target": target,
                                  "qty": qty, "days": 0, "score": round(score, 1)}
 
@@ -263,71 +275,182 @@ def backtest_strategy(data, strategy="full"):
     return closed, equity_curve
 
 
-def report(name, closed, equity_curve):
+def build_indicators(data):
+    """Precompute per-symbol indicators ONCE so the grid search can reuse them
+    across dozens of parameter combos without recomputing (huge speedup)."""
+    ind = {}
+    for sym, df in data.items():
+        c = df["Close"].values; h = df["High"].values; l = df["Low"].values
+        wk_hi = df["High"].resample("W").max()
+        wk_lo = df["Low"].resample("W").min()
+        prev_hi = wk_hi.shift(1).reindex(df.index, method="ffill")
+        prev_lo = wk_lo.shift(1).reindex(df.index, method="ffill")
+        ind[sym] = {
+            "close": c, "high": h, "low": l,
+            "drsi": rsi_series(c, 14),
+            "wrsi": weekly_rsi_aligned(df),
+            "mrsi": monthly_rsi_aligned(df),
+            "midline": (prev_hi + prev_lo) / 2.0,
+            "idx": {d: k for k, d in enumerate(df.index)},
+        }
+    return ind
+
+
+def metrics(closed, equity_curve):
+    """Compute the summary metrics dict for a run."""
     if not closed:
-        print(f"\n{name}: no trades.")
-        return
+        return None
     pnls = np.array([t["pnl"] for t in closed])
     wins = pnls[pnls > 0]; losses = pnls[pnls <= 0]
-    total = pnls.sum()
-    wr = len(wins) / len(pnls) * 100
-    avg_w = wins.mean() if len(wins) else 0
-    avg_l = losses.mean() if len(losses) else 0
-    pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else float("inf")
     eq = np.array([e for _, e in equity_curve])
     peak = np.maximum.accumulate(eq)
     dd = ((eq - peak) / peak * 100).min() if len(eq) else 0
-    ret_pct = (eq[-1] - CAPITAL) / CAPITAL * 100 if len(eq) else 0
+    pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else float("inf")
+    th = sum(1 for t in closed if t["reason"] == "TARGET_HIT")
+    return {
+        "trades": len(closed),
+        "win_rate": len(wins) / len(pnls) * 100,
+        "total_pnl": pnls.sum(),
+        "ret_pct": (eq[-1] - CAPITAL) / CAPITAL * 100 if len(eq) else 0,
+        "avg_win": wins.mean() if len(wins) else 0,
+        "avg_loss": losses.mean() if len(losses) else 0,
+        "pf": pf,
+        "max_dd": dd,
+        "target_hit_rate": th / len(closed) * 100,
+    }
 
+
+def report(name, closed, equity_curve):
+    m = metrics(closed, equity_curve)
+    if not m:
+        print(f"\n{name}: no trades.")
+        return
     reasons = {}
     for t in closed:
         reasons[t["reason"]] = reasons.get(t["reason"], 0) + 1
-
-    print(f"\n{'='*60}\n{name}\n{'='*60}")
-    print(f"  Trades            : {len(closed)}")
-    print(f"  Win rate          : {wr:.1f}%  ({len(wins)}W / {len(losses)}L)")
-    print(f"  Total P&L         : Rs.{total:,.0f}")
-    print(f"  Return on capital : {ret_pct:+.1f}%  over {YEARS}y")
-    print(f"  Avg win / loss    : +Rs.{avg_w:,.0f} / Rs.{avg_l:,.0f}")
-    print(f"  Realized R:R      : {abs(avg_w/avg_l):.2f}" if avg_l else "  Realized R:R      : n/a")
-    print(f"  Profit factor     : {pf:.2f}")
-    print(f"  Max drawdown      : {dd:.1f}%")
+    rr = abs(m["avg_win"]/m["avg_loss"]) if m["avg_loss"] else 0
+    print(f"\n{'='*64}\n{name}\n{'='*64}")
+    print(f"  Trades            : {m['trades']}")
+    print(f"  Win rate          : {m['win_rate']:.1f}%")
+    print(f"  Total P&L         : Rs.{m['total_pnl']:,.0f}")
+    print(f"  Return on capital : {m['ret_pct']:+.1f}%")
+    print(f"  Avg win / loss    : +Rs.{m['avg_win']:,.0f} / Rs.{m['avg_loss']:,.0f}")
+    print(f"  Realized R:R      : {rr:.2f}")
+    print(f"  Profit factor     : {m['pf']:.2f}")
+    print(f"  Max drawdown      : {m['max_dd']:.1f}%")
+    print(f"  TARGET_HIT rate   : {m['target_hit_rate']:.1f}%")
     print(f"  Exit breakdown    : {reasons}")
-    # The structural question: how often does TARGET actually get hit?
-    th = reasons.get("TARGET_HIT", 0)
-    print(f"  >> TARGET_HIT rate: {th/len(closed)*100:.1f}%  "
-          f"(if near 0, the target is unreachable / exits fire first)")
 
 
 def main():
-    print("Fetching historical data (this takes a few minutes)...")
+    import itertools
+    universe = get_universe()
+    print(f"Fetching {len(universe)} symbols (this takes several minutes)...")
     data = {}
-    for k, sym in enumerate(UNIVERSE):
+    for k, sym in enumerate(universe):
         df = fetch(sym)
         if df is not None and len(df) > 260:
             data[sym] = df
-        if (k + 1) % 10 == 0:
-            print(f"  ...{k+1}/{len(UNIVERSE)} fetched")
-        time.sleep(0.3)
-    print(f"\nUsable symbols: {len(data)}/{len(UNIVERSE)}")
-    if len(data) < 10:
-        print("Not enough data — aborting. (Is Yahoo reachable here?)")
+        if (k + 1) % 25 == 0:
+            print(f"  ...{k+1}/{len(universe)} fetched ({len(data)} usable)")
+        time.sleep(0.25)
+    print(f"\nUsable symbols: {len(data)}/{len(universe)}")
+    if len(data) < 30:
+        print("Not enough data — aborting.")
         sys.exit(1)
 
-    print("\nRunning FULL strategy backtest...")
-    c1, e1 = backtest_strategy(data, "full")
-    print("Running SIMPLE RSI baseline backtest...")
-    c2, e2 = backtest_strategy(data, "rsi")
+    print("Precomputing indicators (once, reused across all grid runs)...")
+    ind = build_indicators(data)
 
-    report("FULL STRATEGY (RSI+EMA+ADX, 1xATR stop / 2xATR target)", c1, e1)
-    report("SIMPLE BASELINE (Daily+Weekly+Monthly RSI > 60)", c2, e2)
+    # ── IN-SAMPLE / OUT-OF-SAMPLE SPLIT ───────────────────────────────────────
+    all_dates = sorted(set().union(*[set(df.index) for df in data.values()]))
+    split = all_dates[int(len(all_dates) * 0.66)]   # first 2/3 train, last 1/3 test
+    print(f"\nSplit date: {split.date()}  "
+          f"(in-sample {all_dates[0].date()}→{split.date()}, "
+          f"out-of-sample {split.date()}→{all_dates[-1].date()})")
 
-    print(f"\n{'='*60}\nHONEST CAVEATS\n{'='*60}")
-    print("  - Costs modeled at ~0.3% round trip. Real slippage may be worse.")
-    print("  - Survivorship: universe is today's liquid names; delisted losers")
-    print("    are absent, so BOTH results are optimistic.")
-    print("  - One historical period = one regime sample. Not a guarantee.")
-    print("  - A good result here means 'not yet falsified', NOT 'proven'.")
+    # ── GRID: 3 key parameters, coarse values (54 combos) ─────────────────────
+    grid = {
+        "MIN_ADX":         [15.0, 20.0, 25.0],
+        "ATR_STOP_MULT":   [1.0, 1.5],
+        "ATR_TARGET_MULT": [2.0, 2.5, 3.0],
+    }
+    fixed = {"WEEKLY_RSI_MIN": 60, "DAILY_RSI_EXIT": 52, "WEEKLY_RSI_EXIT": 52}
+    combos = list(itertools.product(*grid.values()))
+    print(f"\nGrid-searching {len(combos)} parameter combos on IN-SAMPLE data...")
+
+    results = []
+    for vals in combos:
+        params = dict(zip(grid.keys(), vals)); params.update(fixed)
+        closed_is, eq_is = backtest_strategy(data, ind, "discount", params,
+                                             date_to=split)
+        m_is = metrics(closed_is, eq_is)
+        if m_is and m_is["trades"] >= 20:
+            results.append((params, m_is))
+
+    if not results:
+        print("No combo produced enough in-sample trades. Aborting.")
+        sys.exit(1)
+
+    # Rank by in-sample profit factor (robust metric, not raw return)
+    results.sort(key=lambda x: x[1]["pf"], reverse=True)
+
+    print(f"\n{'='*64}\nTOP 5 IN-SAMPLE (ranked by profit factor)\n{'='*64}")
+    print(f"  {'ADX':>4} {'Stop':>5} {'Tgt':>4} | {'Trades':>6} {'Win%':>5} {'PF':>5} {'Ret%':>7} {'MaxDD':>6}")
+    for params, m in results[:5]:
+        print(f"  {params['MIN_ADX']:>4.0f} {params['ATR_STOP_MULT']:>5.1f} "
+              f"{params['ATR_TARGET_MULT']:>4.1f} | {m['trades']:>6} "
+              f"{m['win_rate']:>5.1f} {m['pf']:>5.2f} {m['ret_pct']:>+7.1f} {m['max_dd']:>6.1f}")
+
+    # ── OUT-OF-SAMPLE VALIDATION of the best in-sample combo ──────────────────
+    best_params = results[0][0]
+    print(f"\n{'='*64}\nOUT-OF-SAMPLE TEST of best in-sample params\n{'='*64}")
+    print(f"  Params: ADX>{best_params['MIN_ADX']:.0f}, "
+          f"stop {best_params['ATR_STOP_MULT']}xATR, "
+          f"target {best_params['ATR_TARGET_MULT']}xATR")
+    closed_oos, eq_oos = backtest_strategy(data, ind, "discount", best_params,
+                                           date_from=split)
+    report("BEST PARAMS — OUT-OF-SAMPLE (data optimizer never saw)",
+           closed_oos, eq_oos)
+
+    # Also show DEFAULT params out-of-sample, for honest comparison
+    closed_def, eq_def = backtest_strategy(data, ind, "discount", DEFAULT_PARAMS,
+                                           date_from=split)
+    report("DEFAULT PARAMS — OUT-OF-SAMPLE (current bot settings)",
+           closed_def, eq_def)
+
+    # ── Baseline over the FULL period for reference ───────────────────────────
+    closed_b, eq_b = backtest_strategy(data, ind, "rsi", DEFAULT_PARAMS)
+    report("SIMPLE BASELINE (RSI>60) — full period", closed_b, eq_b)
+
+    # ── Discount with DEFAULT params over FULL period ─────────────────────────
+    closed_full, eq_full = backtest_strategy(data, ind, "discount", DEFAULT_PARAMS)
+    report("DISCOUNT (default params) — full period", closed_full, eq_full)
+
+    # ── VERDICT ───────────────────────────────────────────────────────────────
+    m_oos = metrics(closed_oos, eq_oos)
+    m_def_oos = metrics(closed_def, eq_def)
+    print(f"\n{'='*64}\nVERDICT\n{'='*64}")
+    if m_oos and m_def_oos:
+        print(f"  Best-params out-of-sample PF : {m_oos['pf']:.2f}  "
+              f"(win {m_oos['win_rate']:.1f}%, ret {m_oos['ret_pct']:+.1f}%)")
+        print(f"  Default-params out-of-sample : {m_def_oos['pf']:.2f}  "
+              f"(win {m_def_oos['win_rate']:.1f}%, ret {m_def_oos['ret_pct']:+.1f}%)")
+        if m_oos["pf"] > m_def_oos["pf"] * 1.1:
+            print("  → Optimized params held up out-of-sample AND beat defaults.")
+            print("    Worth adopting — but still paper-trade before live.")
+        elif m_oos["pf"] < 1.0:
+            print("  → Best in-sample params FAILED out-of-sample (PF < 1).")
+            print("    This is overfitting. Keep DEFAULT params, do NOT adopt.")
+        else:
+            print("  → Optimized params did not clearly beat defaults out-of-sample.")
+            print("    Keep defaults — the 'improvement' was likely in-sample noise.")
+
+    print(f"\n{'='*64}\nHONEST CAVEATS\n{'='*64}")
+    print("  - The out-of-sample number is what matters. In-sample is fittable.")
+    print("  - Survivorship: today's Nifty 500 excludes delisted losers — optimistic.")
+    print("  - One regime (mostly bullish). Bear/sideways behavior unknown.")
+    print("  - Even an out-of-sample win = 'not falsified', not 'proven'. Paper-trade next.")
 
 
 if __name__ == "__main__":
