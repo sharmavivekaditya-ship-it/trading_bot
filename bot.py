@@ -75,16 +75,13 @@ MIN_MCAP_CR      = 20_000      # Rs. Crores
 
 # Strategy parameters
 RSI_PERIOD       = 14
-WEEKLY_RSI_MIN   = 60          # entry: weekly RSI floor (clean > 60, no ceiling)
-DAILY_RSI_MIN    = 57          # entry: daily RSI floor
-DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
-DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
-WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
+WEEKLY_RSI_MIN   = 60          # entry: weekly RSI floor (uptrend context)
+DAILY_RSI_EXIT   = 52          # exit: daily RSI fade
+WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI fade
 ATR_PERIOD       = 14
-ATR_STOP_MULT    = 1.5         # stop  = entry - 1.5*ATR
-ATR_TARGET_MULT  = 2.5         # target = entry + 2.5*ATR  → R:R 1.67
-                               # (out-of-sample best on full Nifty500: PF 1.07)
-MIN_ADX          = 20.0        # entry: min trend strength (ADX) — real momentum
+ATR_STOP_MULT    = 1.5         # stop   = entry - 1.5*ATR
+ATR_TARGET_MULT  = 2.5         # target = entry + 2.5*ATR  (R:R 1.67)
+MIN_ADX          = 20.0        # entry: min trend strength (ADX)
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
 
@@ -1267,7 +1264,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
       <span class="col-badge cb-open" id="pos-badge">0 / 5</span>
     </div>
     <div class="pos-wrap" id="pos-list">
-      <div class="empty">◎<br>No open positions<br><span style="font-size:11px">Scanning Nifty 500 for Dual RSI setups</span></div>
+      <div class="empty">◎<br>No open positions<br><span style="font-size:11px">Scanning Nifty 500 for discount setups</span></div>
     </div>
     <div class="risk-section">
       <div class="risk-lbl">
@@ -1508,7 +1505,7 @@ async function refresh(){
   // Open positions
   const pl=document.getElementById('pos-list');
   if(!open.length){
-    pl.innerHTML='<div class="empty">◎<br>No open positions<br><span style="font-size:11px">Scanning Nifty 500 for Dual RSI setups</span></div>';
+    pl.innerHTML='<div class="empty">◎<br>No open positions<br><span style="font-size:11px">Scanning Nifty 500 for discount setups</span></div>';
   }else{
     pl.innerHTML=open.map(t=>{
       const u=t.unrealised||0,lp=t.last_price||t.entry;
@@ -2234,7 +2231,7 @@ def start_dashboard():
 def run():
     log.info("=" * 52)
     log.info("  First-Orbit Trader PRO")
-    log.info("  Strategy : Dual RSI Momentum + MCap Filter")
+    log.info("  Strategy : Discount Pullback (buy strength on a dip)")
     log.info(f"  Capital  : Rs.{CAPITAL:,}   Risk/week: Rs.{MAX_WEEKLY_RISK:,}")
     log.info(f"  DB       : {DB_PATH}")
     log.info("=" * 52)
