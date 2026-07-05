@@ -186,14 +186,20 @@ def monthly_rsi_aligned(df):
 
 # ── BACKTEST ENGINES ──────────────────────────────────────────────────────────
 def backtest_strategy(data, ind, strategy="discount", params=None,
-                      date_from=None, date_to=None):
+                      date_from=None, date_to=None, exit_mode="atr",
+                      trail_mode="none"):
     """
     Walk every trading day. Portfolio-level: max MAX_OPEN concurrent positions.
     strategy='discount' → buy strength on prior-week-midline pullback + resumption
     strategy='rsi'      → simple Daily+Weekly+Monthly RSI>60 baseline
     params: dict overriding strategy thresholds (for grid search)
     date_from/date_to: restrict the trading window (for in/out-of-sample split)
-    `ind` is the precomputed-indicator dict (built once, reused across grid runs).
+    exit_mode: 'atr' | 'levels' | 'hybrid' (target/stop placement, see below)
+    trail_mode: how the stop moves as the trade goes green (attacks give-back):
+       'none'      → static stop (current)
+       'breakeven' → once +1xATR in profit, move stop to entry (can't lose)
+       'trail'     → breakeven at +1xATR, then trail stop 1xATR below the peak
+       'atr_trail' → pure Chandelier: stop = peak - 2xATR, ratcheting up only
     """
     P = params or DEFAULT_PARAMS
     MIN_ADX_P    = P["MIN_ADX"]
@@ -218,8 +224,26 @@ def backtest_strategy(data, ind, strategy="discount", params=None,
             p = open_pos[sym]
             px = ind[sym]["close"][i]; hi = ind[sym]["high"][i]; lo = ind[sym]["low"][i]
             days_held = p["days"]; reason = None
+
+            # ── Update trailing stop as the trade goes green (attacks give-back) ──
+            p["peak"] = max(p["peak"], hi)
+            a = p["atr"]; entry = p["entry"]
+            eff_sl = p["sl"]   # effective stop for this bar
+            if trail_mode == "breakeven":
+                if p["peak"] >= entry + 1.0 * a:
+                    eff_sl = max(eff_sl, entry)                  # lock to breakeven
+            elif trail_mode == "trail":
+                if p["peak"] >= entry + 1.0 * a:
+                    eff_sl = max(eff_sl, entry)                  # first to breakeven
+                    eff_sl = max(eff_sl, p["peak"] - 1.0 * a)    # then trail 1xATR
+            elif trail_mode == "atr_trail":
+                eff_sl = max(eff_sl, p["peak"] - 2.0 * a)        # chandelier 2xATR
+            p["sl"] = eff_sl   # ratchet only upward (max() guarantees this)
+
             if lo <= p["sl"]:
-                reason, exit_px = "HARD_STOP", p["sl"]
+                # If the (possibly trailed) stop is above entry, this is a WIN
+                reason = "TRAIL_STOP" if p["sl"] > entry else "HARD_STOP"
+                exit_px = p["sl"]
             elif hi >= p["target"]:
                 reason, exit_px = "TARGET_HIT", p["target"]
             else:
@@ -281,11 +305,38 @@ def backtest_strategy(data, ind, strategy="discount", params=None,
 
             candidates.sort(reverse=True)
             for score, sym, i, price, atr_val in candidates[:slots]:
-                sl = price - STOP_P * atr_val
-                target = price + TGT_P * atr_val
+                atr_sl  = price - STOP_P * atr_val
+                atr_tgt = price + TGT_P * atr_val
+                if exit_mode == "atr":
+                    sl, target = atr_sl, atr_tgt
+                else:
+                    pw_hi = ind[sym]["prev_hi"].iloc[i]
+                    pw_lo = ind[sym]["prev_lo"].iloc[i]
+                    # Need valid levels that bracket entry sensibly
+                    valid = (not np.isnan(pw_hi) and not np.isnan(pw_lo)
+                             and pw_lo < price < pw_hi)
+                    if exit_mode == "levels":
+                        if not valid:
+                            continue   # skip: levels don't frame a trade
+                        sl, target = pw_lo, pw_hi
+                    elif exit_mode == "hybrid":
+                        # Stop at support (prior low) if it's below entry, else ATR stop
+                        sl = pw_lo if (not np.isnan(pw_lo) and pw_lo < price) else atr_sl
+                        risk = price - sl
+                        # Target at resistance (prior high) only if >=2R, else ATR target
+                        if (not np.isnan(pw_hi) and pw_hi > price
+                                and (pw_hi - price) >= 2 * risk):
+                            target = pw_hi
+                        else:
+                            target = atr_tgt
+                    else:
+                        sl, target = atr_sl, atr_tgt
+                if (price - sl) <= 0:
+                    continue
                 qty = max(1, int(RISK_PER_TRADE / (price - sl)))
                 open_pos[sym] = {"entry": price, "sl": sl, "target": target,
-                                 "qty": qty, "days": 0, "score": round(score, 1)}
+                                 "qty": qty, "days": 0, "score": round(score, 1),
+                                 "atr": atr_val, "peak": price}
 
         equity_curve.append((date, equity + sum(
             (ind[s]["close"][ind[s]["idx"][date]] - p["entry"]) * p["qty"]
@@ -311,6 +362,8 @@ def build_indicators(data):
             "wrsi": weekly_rsi_aligned(df),
             "mrsi": monthly_rsi_aligned(df),
             "midline": (prev_hi + prev_lo) / 2.0,
+            "prev_hi": prev_hi,
+            "prev_lo": prev_lo,
             "idx": {d: k for k, d in enumerate(df.index)},
         }
     return ind
@@ -447,6 +500,26 @@ def main():
     closed_full, eq_full = backtest_strategy(data, ind, "discount", DEFAULT_PARAMS)
     report("DISCOUNT (default params) — full period", closed_full, eq_full)
 
+    # ── EXIT-MODE COMPARISON — Vivek's idea: TP/SL at prior-week levels ───────
+    # Tests ATR exits (current) vs support/resistance levels vs hybrid, all
+    # OUT-OF-SAMPLE so we judge on data the choice wasn't fit to.
+    print(f"\n{'#'*64}\nEXIT-MODE TEST: ATR vs prior-week LEVELS vs HYBRID (out-of-sample)\n{'#'*64}")
+    for mode in ["atr", "levels", "hybrid"]:
+        c_m, e_m = backtest_strategy(data, ind, "discount", DEFAULT_PARAMS,
+                                     date_from=split, exit_mode=mode)
+        report(f"EXIT={mode.upper()} — out-of-sample", c_m, e_m)
+
+    # ── TRAIL-MODE TEST — attacks the "gives back gains to stop" problem ──────
+    # Uses the validated 1.5/2.5 ATR exit; varies only how the stop trails.
+    P25 = dict(DEFAULT_PARAMS); P25["ATR_STOP_MULT"] = 1.5; P25["ATR_TARGET_MULT"] = 2.5
+    print(f"\n{'#'*64}\nTRAIL-MODE TEST: static vs breakeven vs trail vs chandelier (out-of-sample)\n{'#'*64}")
+    trail_results = {}
+    for tm in ["none", "breakeven", "trail", "atr_trail"]:
+        c_t, e_t = backtest_strategy(data, ind, "discount", P25,
+                                     date_from=split, exit_mode="atr", trail_mode=tm)
+        report(f"TRAIL={tm.upper()} — out-of-sample (1.5/2.5 exits)", c_t, e_t)
+        trail_results[tm] = metrics(c_t, e_t)
+
     # ── VERDICT ───────────────────────────────────────────────────────────────
     m_oos = metrics(closed_oos, eq_oos)
     m_def_oos = metrics(closed_def, eq_def)
@@ -465,6 +538,22 @@ def main():
         else:
             print("  → Optimized params did not clearly beat defaults out-of-sample.")
             print("    Keep defaults — the 'improvement' was likely in-sample noise.")
+
+    # Trail-mode verdict — which stop-trailing method wins out-of-sample?
+    if trail_results:
+        print(f"\n  TRAIL-MODE ranking (out-of-sample, 1.5/2.5 exits):")
+        ranked = sorted([(m["pf"], tm, m) for tm, m in trail_results.items()
+                         if m], reverse=True)
+        for pf, tm, m in ranked:
+            print(f"    {tm:10s}: PF {pf:.2f}  win {m['win_rate']:.1f}%  "
+                  f"ret {m['ret_pct']:+.1f}%  maxDD {m['max_dd']:.1f}%")
+        best_tm = ranked[0][1] if ranked else "none"
+        base_pf = trail_results.get("none", {}).get("pf", 0) if trail_results.get("none") else 0
+        if ranked and ranked[0][0] > base_pf * 1.05 and best_tm != "none":
+            print(f"  → '{best_tm}' trailing beat the static stop out-of-sample.")
+            print(f"    Worth adopting into the live exit logic (then paper-trade).")
+        else:
+            print("  → No trail mode clearly beat the static stop. Keep static.")
 
     print(f"\n{'='*64}\nHONEST CAVEATS\n{'='*64}")
     print("  - The out-of-sample number is what matters. In-sample is fittable.")

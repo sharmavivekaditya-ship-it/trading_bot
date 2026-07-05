@@ -5,9 +5,9 @@ Pure algorithmic, no AI API required.
 STRATEGY : Pullback-in-Uptrend (buy strength on a discount)
 ENTRY    : Weekly RSI > 60  AND  EMA9>21>50  AND  ADX(14) > 20   (uptrend context)
            AND  price pulled back below prior-week midline, now turning up & reclaiming it
-STOP     : Entry - 1.0 x ATR(14)
-TARGET   : Entry + 3.0 x ATR(14)    (R:R 3.0, out-of-sample validated)
-EXIT     : Daily RSI < 52  |  Weekly RSI < 52  |  Bearish divergence (min 2 days)  |  Hard stop
+STOP     : Entry - 1.5 x ATR(14)
+TARGET   : Entry + 2.5 x ATR(14)    (R:R 1.67, out-of-sample best on Nifty500)
+EXIT     : Target hit (2.5xATR) | Daily RSI < 52 | Weekly RSI < 52 | Divergence | Hard stop
 SIZE     : qty = Rs.800 / (entry - stop)
 SCAN     : Two-pass — collect ALL setups across Nifty 500, rank by score, trade TOP 5 only
 HOLD     : Swing — carry across days, no intraday square-off
@@ -81,9 +81,9 @@ DAILY_RSI_MAX    = 67          # entry: daily RSI ceiling (not overextended)
 DAILY_RSI_EXIT   = 52          # exit: daily RSI fade (tighter for fast exits)
 WEEKLY_RSI_EXIT  = 52          # exit: weekly RSI drops below this
 ATR_PERIOD       = 14
-ATR_STOP_MULT    = 1.0         # stop  = entry - 1.0*ATR
-ATR_TARGET_MULT  = 3.0         # target = entry + 3.0*ATR  → R:R 3.0
-                               # (validated out-of-sample: PF 1.20 vs 1.05 at 2.0x)
+ATR_STOP_MULT    = 1.5         # stop  = entry - 1.5*ATR
+ATR_TARGET_MULT  = 2.5         # target = entry + 2.5*ATR  → R:R 1.67
+                               # (out-of-sample best on full Nifty500: PF 1.07)
 MIN_ADX          = 20.0        # entry: min trend strength (ADX) — real momentum
 DIV_LOOKBACK     = 10          # bars for divergence detection
 MIN_DAYS_DIV     = 2           # min days held before divergence can trigger
@@ -593,7 +593,13 @@ def manage_positions(con):
         con.execute("UPDATE trades SET days_held=? WHERE id=?", (days, t["id"]))
         # Check exits
         reason = None
-        if price <= t["sl"]:
+        # TARGET_HIT — take profit when price reaches the target. This was the
+        # critical missing check: without it the bot could NEVER book a profit
+        # at target and would ride winners back down (e.g. ATHERENERG ran far
+        # past target and only closed because it was closed manually).
+        if t["target"] and price >= t["target"]:
+            reason = "TARGET_HIT"
+        if not reason and price <= t["sl"]:
             reason = "HARD_STOP"
         if not reason:
             try:
@@ -1202,7 +1208,7 @@ body{background:var(--bg);color:var(--t1);font-family:var(--sans);min-height:100
   <span class="sc">EMA 9&gt;21&gt;50 · ADX&gt;20</span>
   <span class="sc">MCap &gt; Rs.20,000 Cr</span>
   <span class="sc">Buy below week-midline, turning up</span>
-  <span class="sc">TGT 3×ATR · Stop 1×ATR</span>
+  <span class="sc">TGT 2.5×ATR · Stop 1.5×ATR</span>
   <span class="sc">Exit: RSI fade · Divergence</span>
   <span class="sc">Top 5 · Nifty 500</span>
 </div>
